@@ -49,6 +49,16 @@ GOOGLE_NEWS_HORMUZ_RSS_URL = (
 
 GOOGLE_NEWS_RSS_BASE = "https://news.google.com/rss/search"
 
+# Browser-like defaults reduce blocks from Google RSS on cloud IPs.
+DEFAULT_RSS_REQUEST_HEADERS: dict[str, str] = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.7",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
 
 def _google_news_rss_url(query: str, *, hl: str = "en-US", gl: str = "US", ceid: str = "US:en") -> str:
     q = quote_plus(query)
@@ -80,6 +90,7 @@ def fetch_live_rss_entries(
     *,
     limit: int = 10,
     timeout_s: float = 12.0,
+    request_headers: dict[str, str] | None = None,
 ) -> list[dict[str, str]]:
     """
     Fetch a live RSS feed and normalize entries as:
@@ -87,10 +98,7 @@ def fetch_live_rss_entries(
 
     For Google News RSS, `title` often looks like: "Headline text - Publisher".
     """
-    headers = {
-        "User-Agent": "iran-war-tracker/0.1 (+streamlit; osint)",
-        "Accept": "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.1",
-    }
+    headers = {**DEFAULT_RSS_REQUEST_HEADERS, **(request_headers or {})}
     r = requests.get(feed_url, headers=headers, timeout=timeout_s)
     r.raise_for_status()
 
@@ -129,6 +137,7 @@ def fetch_live_google_news_multiquery(
     per_query_limit: int = 10,
     timeout_s: float = 12.0,
     min_results: int = 5,
+    request_headers: dict[str, str] | None = None,
 ) -> list[dict[str, str]]:
     """
     Fetch multiple Google News RSS queries and merge results.
@@ -139,7 +148,9 @@ def fetch_live_google_news_multiquery(
 
     for q in queries:
         url = _google_news_rss_url(q)
-        items = fetch_live_rss_entries(url, limit=per_query_limit, timeout_s=timeout_s)
+        items = fetch_live_rss_entries(
+            url, limit=per_query_limit, timeout_s=timeout_s, request_headers=request_headers
+        )
         for it in items:
             key = (it.get("Source", ""), it.get("Title", ""), it.get("Link", ""))
             if key in seen:

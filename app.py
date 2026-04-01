@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 from datetime import UTC, datetime, timedelta
 
 import pandas as pd
@@ -16,6 +17,15 @@ from logic import (
     fetch_realtime_shipping_stats,
 )
 
+# Sent with RSS fetches so cloud egress IPs are less likely to be blocked by Google News.
+NEWS_RSS_REQUEST_HEADERS: dict[str, str] = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.7",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 DEADLINE_UTC = datetime(2026, 4, 1, 16, 30, tzinfo=UTC)  # 16:30 GMT == 20:00 Tehran
 
@@ -128,7 +138,7 @@ def render_tactical_alert_banner(now_utc: datetime) -> None:
           .tacticalTimer {{
             font-size: 42px;
             line-height: 1.05;
-            color: #ff2d2d;
+            color: #FFFF00;
             font-weight: 1000;
             margin-top: 6px;
           }}
@@ -161,33 +171,60 @@ def _safe_float(x) -> float | None:
         return None
 
 
+def _yf_intraday_usable(df: pd.DataFrame | None, tickers: list[str]) -> bool:
+    if df is None or df.empty:
+        return False
+    for t in tickers:
+        try:
+            if isinstance(df.columns, pd.MultiIndex) and (t, "Close") in df.columns:
+                if df[(t, "Close")].dropna().size > 0:
+                    return True
+            elif not isinstance(df.columns, pd.MultiIndex) and "Close" in df.columns:
+                if df["Close"].dropna().size > 0:
+                    return True
+        except Exception:
+            continue
+    return False
+
+
+def _yf_download_with_retry(
+    *,
+    tickers: list[str],
+    period: str,
+    interval: str,
+    max_attempts: int = 4,
+    delay_s: float = 0.65,
+) -> pd.DataFrame:
+    last: pd.DataFrame = pd.DataFrame()
+    for attempt in range(max_attempts):
+        try:
+            last = yf.download(
+                tickers=tickers,
+                period=period,
+                interval=interval,
+                group_by="ticker",
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+            )
+        except Exception:
+            last = pd.DataFrame()
+        if last is not None and not last.empty:
+            if period == "1d" and interval == "1m":
+                if _yf_intraday_usable(last, tickers):
+                    return last
+            else:
+                return last
+        time.sleep(delay_s * (attempt + 1))
+    return last if last is not None else pd.DataFrame()
+
+
 def fetch_market_watch() -> list[dict]:
     tickers = ["AAPL", "GOOGL", "MSFT", "META", "NVDA", "TSLA", "INTC", "IBM", "BA", "DELL", "HPE", "CSCO", "ORCL", "JPM", "GE", "AMZN"]
     out: list[dict] = []
 
-    # Cache buster: yfinance sometimes reuses responses; force new calls by changing `end`.
-    cb = int(time.time())
-
-    intraday = yf.download(
-        tickers=tickers,
-        period="1d",
-        interval="1m",
-        group_by="ticker",
-        auto_adjust=False,
-        progress=False,
-        threads=True,
-        end=pd.Timestamp.utcnow() + pd.Timedelta(seconds=cb % 3),
-    )
-    daily2 = yf.download(
-        tickers=tickers,
-        period="2d",
-        interval="1d",
-        group_by="ticker",
-        auto_adjust=False,
-        progress=False,
-        threads=True,
-        end=pd.Timestamp.utcnow() + pd.Timedelta(seconds=(cb + 1) % 3),
-    )
+    intraday = _yf_download_with_retry(tickers=tickers, period="1d", interval="1m")
+    daily2 = _yf_download_with_retry(tickers=tickers, period="2d", interval="1d")
 
     for t in tickers:
         last = None
@@ -239,16 +276,18 @@ def render_market_grid(rows: list[dict]) -> None:
         ch_s = "—" if ch is None else f"{ch:+.2f}%"
         p_s = "—" if p is None else f"${p:,.2f}"
         is_down = (ch is not None) and (ch <= -2.0)
-        color = "#ff3b3b" if is_down else "#e6e6e6"
-        bg = "rgba(255, 0, 0, 0.10)" if is_down else "rgba(255, 255, 255, 0.03)"
+        label_color = "#FFFFFF"
+        num_color = "#FFFF00"
+        ch_color = "#ff3b3b" if is_down else num_color
+        bg = "rgba(255, 0, 0, 0.10)" if is_down else "rgba(255, 255, 255, 0.06)"
         c.markdown(
             f"""
-            <div style="border:1px solid #2b2b2b; background:{bg}; border-radius:10px; padding:10px 10px; margin-bottom:8px;">
+            <div style="border:2px solid #FFFFFF; background:{bg}; border-radius:10px; padding:10px 10px; margin-bottom:8px;">
               <div style="display:flex; justify-content:space-between; align-items:center;">
-                <div style="font-weight:900; color:#9aa0a6; letter-spacing:0.10em; font-size:12px;">{t}</div>
-                <div style="font-weight:900; color:{color}; font-size:12px;">{ch_s}</div>
+                <div style="font-weight:900; color:{label_color}; letter-spacing:0.10em; font-size:1rem;">{t}</div>
+                <div style="font-weight:900; color:{ch_color}; font-size:1.05rem;">{ch_s}</div>
               </div>
-              <div style="font-weight:900; color:{color}; font-size:18px; margin-top:6px;">{p_s}</div>
+              <div style="font-weight:900; color:{num_color}; font-size:1.35rem; margin-top:6px;">{p_s}</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -324,9 +363,49 @@ def main() -> None:
     st.markdown(
         """
         <style>
-          /* Dark trading-terminal vibe */
-          .stApp { background: #0b0f14; color: #e6e6e6; }
-          [data-testid="stHeader"] { background: rgba(0,0,0,0); }
+          /* iPad / accessibility: maximum contrast */
+          .stApp {
+            background: #000000 !important;
+            color: #FFFFFF !important;
+          }
+          .stApp p, .stApp li, .stApp label, .stApp .stMarkdown {
+            color: #FFFFFF !important;
+          }
+          .stApp p, .stApp .stMarkdown p, .stApp [data-testid="stMarkdownContainer"] p {
+            font-size: 1.2rem !important;
+            line-height: 1.55 !important;
+          }
+          .stApp h1 { font-size: 3.3rem !important; }
+          .stApp h2 { font-size: 2.64rem !important; }
+          .stApp h3 { font-size: 2.04rem !important; }
+          .stApp .stMarkdown h1 { font-size: 3.3rem !important; }
+          .stApp .stMarkdown h2 { font-size: 2.64rem !important; }
+          .stApp .stMarkdown h3 { font-size: 2.04rem !important; }
+
+          [data-testid="stMetricValue"] { color: #FFFF00 !important; font-weight: 800 !important; }
+          [data-testid="stMetricLabel"] { color: #FFFFFF !important; font-size: 1.05rem !important; }
+
+          section[data-testid="stSidebar"] [data-testid="stDataFrame"] td {
+            color: #FFFF00 !important;
+            font-weight: 700 !important;
+            font-size: 1.1rem !important;
+          }
+          section[data-testid="stSidebar"] [data-testid="stDataFrame"] th {
+            color: #FFFFFF !important;
+            font-size: 1.05rem !important;
+          }
+
+          .discerner-logic-box {
+            border: 2px solid #FFFFFF;
+            border-radius: 10px;
+            padding: 14px 16px;
+            margin: 0 0 12px 0;
+            background: #0a0a0a;
+          }
+          .discerner-logic-box p { font-size: 1.2rem !important; color: #FFFFFF !important; margin: 0 0 8px 0; }
+          .discerner-logic-box .discerner-rationale { font-size: 1.05rem !important; opacity: 1; color: #FFFFFF !important; }
+
+          [data-testid="stHeader"] { background: #000000 !important; }
           [data-testid="stToolbar"] { visibility: hidden; height: 0px; }
           .block-container { padding-top: 1.2rem; }
         </style>
@@ -348,8 +427,8 @@ def main() -> None:
             def _style_row(row):
                 ch = row.get("% Change")
                 if pd.notna(ch) and float(ch) <= -2.0:
-                    return ["color: #ff3b3b; font-weight: 800"] * len(row)
-                return [""] * len(row)
+                    return ["color: #ff3b3b; font-weight: 800; font-size: 1.1rem"] * len(row)
+                return ["color: #FFFF00; font-weight: 700; font-size: 1.1rem"] * len(row)
 
             st.dataframe(
                 mw_df.style.apply(_style_row, axis=1),
@@ -438,14 +517,28 @@ def main() -> None:
                 "(Hormuz OR 'Red Sea') AND (shipping OR tanker OR strike)",
                 "(Israel OR 'United States') AND Iran AND war AND live",
             ]
-            return fetch_live_google_news_multiquery(queries, per_query_limit=15, min_results=5)
+            return fetch_live_google_news_multiquery(
+                queries,
+                per_query_limit=15,
+                min_results=5,
+                request_headers=NEWS_RSS_REQUEST_HEADERS,
+            )
 
         entries = _cached_live_entries()
         discerner = evaluate_strait_status_from_live_entries(entries)
+        rationale_esc = html.escape(discerner.rationale)
+        status_esc = html.escape(discerner.strait_status)
+        risk_esc = html.escape(discerner.war_risk_level)
         st.markdown(
-            f"**The Discerner (Live):** Strait status **{discerner.strait_status}** • War risk **{discerner.war_risk_level}**"
+            f"""
+            <div class="discerner-logic-box">
+              <p><strong>The Discerner (Live):</strong> Strait status <strong>{status_esc}</strong>
+              • War risk <strong>{risk_esc}</strong></p>
+              <p class="discerner-rationale">{rationale_esc}</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
-        st.caption(discerner.rationale)
         if discerner.war_risk_level.upper() == "CRITICAL":
             st.warning("Market volatility expected to spike at 16:30 GMT.")
 
