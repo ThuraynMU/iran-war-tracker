@@ -604,6 +604,17 @@ def main() -> None:
     tactical_osint_rows, hormuz_kinetic_flash = _cached_liveuamap_bundle()
     tehran_official_rows, tehran_feed_caption = _cached_tehran_narrative()
 
+    _top_pad, _top_refresh = st.columns([6, 1], gap="small")
+    with _top_refresh:
+        if st.button(
+            "🔄 Manual Refresh",
+            use_container_width=True,
+            key="manual_refresh_top_right",
+            help="Clear cached RSS, news, and market data and rerun",
+        ):
+            st.cache_data.clear()
+            st.rerun()
+
     st.markdown(
         """
         <style>
@@ -795,17 +806,6 @@ def main() -> None:
             st.caption(n)
 
     render_tactical_alert_banner(now)
-
-    _top_pad, _top_refresh = st.columns([6, 1], gap="small")
-    with _top_refresh:
-        if st.button(
-            "🔄 Manual Refresh",
-            use_container_width=True,
-            key="manual_refresh_top_right",
-            help="Clear cached RSS, news, and market data and rerun",
-        ):
-            st.cache_data.clear()
-            st.rerun()
 
     # Big-number metrics (same cache as sidebar — one PortWatch/IMF fetch per TTL, not two)
     hs_main = _cached_hormuz_stats()
