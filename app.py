@@ -368,6 +368,15 @@ def main() -> None:
             background: #000000 !important;
             color: #FFFFFF !important;
           }
+          /* Scoped surfaces only — never `*` (breaks Streamlit layers/widgets). */
+          .stApp [data-testid="stAppViewContainer"] {
+            background-color: transparent !important;
+            color: #FFFFFF !important;
+          }
+          .stApp [data-testid="stMarkdownContainer"],
+          .stApp [data-testid="stVerticalBlock"] {
+            color: #FFFFFF !important;
+          }
           .stApp p, .stApp li, .stApp label, .stApp .stMarkdown {
             color: #FFFFFF !important;
           }
