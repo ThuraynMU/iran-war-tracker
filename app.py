@@ -363,22 +363,31 @@ def main() -> None:
     st.markdown(
         """
         <style>
-          /* iPad / accessibility: maximum contrast */
-          .stApp {
-            background: #000000 !important;
-            color: #FFFFFF !important;
+          /*
+            High contrast for tablets: drive Streamlit's own tokens so widgets use
+            white text on black (custom CSS was fighting var(--st-text-color)).
+            Do not hide stToolbar — it can collapse the main flex layout on some builds.
+          */
+          :root {
+            --st-text-color: #ffffff !important;
+            --st-background-color: #000000 !important;
+            --st-secondary-background-color: #141414 !important;
           }
-          /* Scoped surfaces only — never `*` (breaks Streamlit layers/widgets). */
-          .stApp [data-testid="stAppViewContainer"] {
-            background-color: transparent !important;
-            color: #FFFFFF !important;
+          .stApp {
+            background-color: #000000 !important;
+            color: #ffffff !important;
+          }
+          [data-testid="stAppViewContainer"],
+          [data-testid="stMain"] {
+            background-color: #000000 !important;
+            color: #ffffff !important;
           }
           .stApp [data-testid="stMarkdownContainer"],
           .stApp [data-testid="stVerticalBlock"] {
-            color: #FFFFFF !important;
+            color: #ffffff !important;
           }
           .stApp p, .stApp li, .stApp label, .stApp .stMarkdown {
-            color: #FFFFFF !important;
+            color: #ffffff !important;
           }
           .stApp p, .stApp .stMarkdown p, .stApp [data-testid="stMarkdownContainer"] p {
             font-size: 1.2rem !important;
@@ -391,31 +400,38 @@ def main() -> None:
           .stApp .stMarkdown h2 { font-size: 2.64rem !important; }
           .stApp .stMarkdown h3 { font-size: 2.04rem !important; }
 
-          [data-testid="stMetricValue"] { color: #FFFF00 !important; font-weight: 800 !important; }
-          [data-testid="stMetricLabel"] { color: #FFFFFF !important; font-size: 1.05rem !important; }
+          [data-testid="stMetricValue"] { color: #ffff00 !important; font-weight: 800 !important; }
+          [data-testid="stMetricLabel"] { color: #ffffff !important; font-size: 1.05rem !important; }
 
           section[data-testid="stSidebar"] [data-testid="stDataFrame"] td {
-            color: #FFFF00 !important;
+            color: #ffff00 !important;
             font-weight: 700 !important;
             font-size: 1.1rem !important;
           }
           section[data-testid="stSidebar"] [data-testid="stDataFrame"] th {
-            color: #FFFFFF !important;
+            color: #ffffff !important;
             font-size: 1.05rem !important;
           }
 
           .discerner-logic-box {
-            border: 2px solid #FFFFFF;
+            border: 2px solid #ffffff;
             border-radius: 10px;
             padding: 14px 16px;
             margin: 0 0 12px 0;
             background: #0a0a0a;
           }
-          .discerner-logic-box p { font-size: 1.2rem !important; color: #FFFFFF !important; margin: 0 0 8px 0; }
-          .discerner-logic-box .discerner-rationale { font-size: 1.05rem !important; opacity: 1; color: #FFFFFF !important; }
+          .discerner-logic-box p {
+            font-size: 1.2rem !important;
+            color: #ffffff !important;
+            margin: 0 0 8px 0;
+          }
+          .discerner-logic-box .discerner-rationale {
+            font-size: 1.05rem !important;
+            opacity: 1;
+            color: #ffffff !important;
+          }
 
-          [data-testid="stHeader"] { background: #000000 !important; }
-          [data-testid="stToolbar"] { visibility: hidden; height: 0px; }
+          [data-testid="stHeader"] { background-color: #000000 !important; }
           .block-container { padding-top: 1.2rem; }
         </style>
         """,
