@@ -385,6 +385,126 @@ def _cached_market_watch() -> list[dict]:
         return []
 
 
+# (label, Yahoo ticker, unit blurb for display)
+_COMMODITY_DEFS: list[tuple[str, str, str]] = [
+    ("Gold", "GC=F", "$/oz"),
+    ("Silver", "SI=F", "$/oz"),
+    ("Brent", "BZ=F", "$/bbl"),
+    ("Aluminum", "ALI=F", "$/MT"),
+    ("Fertilizer", "NTR", "$/sh NTR"),
+    ("Gasoline", "RB=F", "$/gal"),
+]
+
+
+def fetch_commodity_watch() -> list[dict]:
+    """Gold/silver/Brent/aluminum/Nutrien (fertilizer proxy)/RBOB via yfinance."""
+    tickers = [t for _, t, _ in _COMMODITY_DEFS]
+    out: list[dict] = []
+
+    intraday = _yf_download_with_retry(tickers=tickers, period="1d", interval="1m")
+    daily2 = _yf_download_with_retry(tickers=tickers, period="2d", interval="1d")
+
+    for label, t, unit in _COMMODITY_DEFS:
+        last = None
+        prev_close = None
+        pct = None
+
+        try:
+            if isinstance(intraday.columns, pd.MultiIndex):
+                s = intraday[(t, "Close")].dropna()
+            else:
+                s = intraday["Close"].dropna()
+            if len(s) > 0:
+                last = _safe_float(s.iloc[-1])
+        except Exception:
+            last = None
+
+        try:
+            if isinstance(daily2.columns, pd.MultiIndex):
+                d = daily2[(t, "Close")].dropna()
+            else:
+                d = daily2["Close"].dropna()
+            if len(d) >= 2:
+                prev_close = _safe_float(d.iloc[-2])
+        except Exception:
+            prev_close = None
+
+        if (prev_close is not None) and (last is not None) and prev_close != 0:
+            pct = (last - prev_close) / prev_close * 100.0
+
+        out.append(
+            {
+                "Label": label,
+                "Ticker": t,
+                "Unit": unit,
+                "Price": last,
+                "Prev close": prev_close,
+                "% Change": pct,
+            }
+        )
+    return out
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_commodity_watch() -> list[dict]:
+    try:
+        return fetch_commodity_watch()
+    except Exception:
+        return []
+
+
+def _format_commodity_price(label: str, price: float | None) -> str:
+    if price is None:
+        return "—"
+    if label == "Gold":
+        return f"${price:,.2f}"
+    if label == "Silver":
+        return f"${price:,.3f}"
+    if label == "Brent":
+        return f"${price:,.2f}"
+    if label == "Aluminum":
+        return f"${price:,.0f}"
+    if label == "Fertilizer":
+        return f"${price:,.2f}"
+    if label == "Gasoline":
+        return f"${price:,.3f}"
+    return f"${price:,.2f}"
+
+
+def render_commodity_tracker(rows: list[dict]) -> None:
+    """Compact 2×3 cards for the left column under shipping."""
+    st.markdown("**Commodities & energy**")
+    cols = st.columns(2, gap="small")
+    for i, r in enumerate(rows):
+        c = cols[i % 2]
+        lab = str(r.get("Label", "—"))
+        unit = str(r.get("Unit", ""))
+        price = r.get("Price")
+        ch = r.get("% Change")
+        ch_s = "—" if ch is None else f"{ch:+.2f}%"
+        p_s = _format_commodity_price(lab, float(price) if price is not None else None)
+        is_down = (ch is not None) and (ch <= -2.0)
+        label_color = "#FFFFFF"
+        num_color = "#FFFF00"
+        ch_color = "#ff3b3b" if is_down else num_color
+        bg = "rgba(255, 0, 0, 0.10)" if is_down else "rgba(255, 255, 255, 0.06)"
+        sub = html.escape(unit)
+        c.markdown(
+            f"""
+            <div style="border:2px solid #FFFFFF; background:{bg}; border-radius:10px; padding:10px 10px; margin-bottom:8px;">
+              <div style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
+                <div style="font-weight:900; color:{label_color}; letter-spacing:0.06em; font-size:0.95rem;">{html.escape(lab)}</div>
+                <div style="font-weight:900; color:{ch_color}; font-size:0.95rem;">{ch_s}</div>
+              </div>
+              <div style="font-weight:900; color:{num_color}; font-size:1.2rem; margin-top:6px;">{p_s}</div>
+              <div style="font-size:0.78rem; color:#cccccc; margin-top:4px; opacity:0.95;">{sub}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    st.caption("Yahoo Finance: futures where listed; fertilizer as Nutrien (NTR) equity proxy.")
+
+
 def render_market_grid(rows: list[dict]) -> None:
     # Compact grid above the news feed.
     st.markdown("**Targeted Firm Market Monitor**")
@@ -740,6 +860,13 @@ def main() -> None:
         st.dataframe(df, use_container_width=True, hide_index=True)
         st.error("Rotterdam alert: Suez Transit Effectively Zero.")
         st.caption("Delays are synthetic. During the deadline window (+24h), Cape routing is forced for EU ports.")
+
+        with st.container(border=True):
+            comm = _cached_commodity_watch()
+            if comm:
+                render_commodity_tracker(comm)
+            else:
+                st.caption("Commodity prices unavailable (yfinance fetch failed).")
 
     with col_right:
         st.subheader("Live Intel Feed")
