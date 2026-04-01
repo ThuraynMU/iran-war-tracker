@@ -5,6 +5,7 @@ import os
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from email.utils import parsedate_to_datetime
 
 import folium
 import pandas as pd
@@ -193,6 +194,93 @@ def compute_bgri(
         pct_vs_baseline=pct_vs_baseline,
         today_hits=today_hits,
         headline_sample_size=len(headlines),
+    )
+
+
+def _osint_row_time_ts(row: dict) -> float:
+    raw = str(row.get("Date/Time (UTC)") or "").strip().replace(" GMT", "")
+    if not raw:
+        return 0.0
+    try:
+        dt = parsedate_to_datetime(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt.timestamp()
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+
+
+def recent_kinetic_strike_osint_titles(rows: list[dict], *, limit: int = 5) -> list[str]:
+    """Five most recent OSINT headlines whose titles mention kinetic or strike (word substring)."""
+    scored: list[tuple[float, str]] = []
+    for r in rows or []:
+        t = str(r.get("Title") or "").strip()
+        if not t:
+            continue
+        low = t.casefold()
+        if "kinetic" not in low and "strike" not in low:
+            continue
+        scored.append((_osint_row_time_ts(r), t))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    seen: set[str] = set()
+    titles: list[str] = []
+    for _ts, t in scored:
+        k = t.casefold()
+        if k in seen:
+            continue
+        seen.add(k)
+        titles.append(t)
+        if len(titles) >= limit:
+            break
+    return titles
+
+
+def render_osint_kinetic_marquee(rows: list[dict]) -> None:
+    """Bottom-of-page scrolling ticker: kinetic/strike lines from LiveUAMap / Google OSINT bundle."""
+    titles = recent_kinetic_strike_osint_titles(rows, limit=5)
+    sep = "    •    "
+    if not titles:
+        core = html.escape("OSINT: no kinetic/strike-tagged headlines in the current window.")
+    else:
+        core = sep.join(html.escape(t) for t in titles)
+    chunk = f'<span class="osint-marquee-text">{core}{sep}</span>'
+    st.markdown(
+        f"""
+        <div class="osint-marquee-wrap">
+          <style>
+            .osint-marquee-wrap {{
+              background: #000000;
+              border-top: 2px solid #3d3d3d;
+              overflow: hidden;
+              padding: 14px 0;
+              margin-top: 12px;
+            }}
+            .osint-marquee-track {{
+              display: flex;
+              width: max-content;
+              animation: osintMarqueeScroll 50s linear infinite;
+            }}
+            .osint-marquee-track:hover {{
+              animation-play-state: paused;
+            }}
+            @keyframes osintMarqueeScroll {{
+              0% {{ transform: translateX(0); }}
+              100% {{ transform: translateX(-50%); }}
+            }}
+            .osint-marquee-text {{
+              color: #ffff00;
+              font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+              font-weight: 700;
+              font-size: 1.08rem;
+              letter-spacing: 0.02em;
+              white-space: nowrap;
+              flex-shrink: 0;
+            }}
+          </style>
+          <div class="osint-marquee-track">{chunk}{chunk}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
 
@@ -1296,6 +1384,8 @@ def main() -> None:
                     st.warning("Waiting for news sync...")
             else:
                 st.warning("No RSS entries were fetched.")
+
+    render_osint_kinetic_marquee(tactical_osint_rows)
 
 
 if __name__ == "__main__":
