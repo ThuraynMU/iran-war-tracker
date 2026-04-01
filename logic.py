@@ -563,6 +563,62 @@ def fetch_newsdata_iran_english(
     return rows
 
 
+# English Iran narrative RSS (state-affiliated) when NewsData.io has no rows / no API key.
+PRESSTV_IRAN_RSS_URL = "https://www.presstv.ir/rss/rss-101.xml"
+
+
+def fetch_official_tehran_narrative(
+    *,
+    api_key: str | None,
+    timeout_s: float = 25.0,
+    request_headers: dict[str, str] | None = None,
+) -> tuple[list[dict[str, str]], str | None]:
+    """
+    Prefer NewsData.io (Iran). If it returns no articles, use Press TV Iran RSS (English).
+    Second return value is an optional short caption for the UI (source / limitations).
+    """
+    rows_nd, hint_nd = fetch_newsdata_iran_feed(
+        api_key=api_key, timeout_s=timeout_s, request_headers=request_headers
+    )
+    if rows_nd:
+        return rows_nd, None
+
+    try:
+        pv = fetch_live_rss_entries(
+            PRESSTV_IRAN_RSS_URL,
+            limit=22,
+            timeout_s=timeout_s,
+            request_headers=request_headers,
+        )
+    except Exception:
+        pv = []
+
+    if pv:
+        for it in pv:
+            it["Source"] = "Press TV (Iran RSS)"
+        if (api_key or "").strip():
+            cap = (
+                "NewsData.io returned no articles for this run; showing Press TV Iran RSS "
+                "(English, state-affiliated). Check NewsData quota or parameters."
+            )
+        else:
+            cap = (
+                "No NEWSDATA_API_KEY — using Press TV Iran RSS (English). "
+                "Add a NewsData key in Streamlit **Secrets** to merge the API feed."
+            )
+        if hint_nd and ("HTTP" in hint_nd or "failed" in hint_nd.lower()):
+            cap = f"{cap} ({hint_nd})"
+        return pv, cap
+
+    tail = hint_nd
+    if not tail:
+        tail = (
+            "No articles from NewsData.io or Press TV RSS. "
+            "Add NEWSDATA_API_KEY for NewsData, or check network access to presstv.ir."
+        )
+    return [], tail
+
+
 def fetch_liveuamap_mideast_kinetic(
     *,
     timeout_s: float = 20.0,

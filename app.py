@@ -16,7 +16,7 @@ from logic import (
     evaluate_strait_status_from_live_entries,
     fetch_live_google_news_multiquery,
     fetch_liveuamap_mideast_kinetic,
-    fetch_newsdata_iran_feed,
+    fetch_official_tehran_narrative,
     fetch_hormuz_stats,
     fetch_realtime_shipping_stats,
 )
@@ -90,8 +90,11 @@ def _cached_liveuamap_bundle():
 
 
 @st.cache_data(ttl=90, show_spinner=False)
-def _cached_newsdata_tehran():
-    return fetch_newsdata_iran_feed(api_key=_newsdata_api_key(), request_headers=NEWS_RSS_REQUEST_HEADERS)
+def _cached_tehran_narrative():
+    return fetch_official_tehran_narrative(
+        api_key=_newsdata_api_key(),
+        request_headers=NEWS_RSS_REQUEST_HEADERS,
+    )
 
 
 def _prepare_intel_dataframe(entries: list[dict]) -> pd.DataFrame | None:
@@ -125,6 +128,43 @@ def _intel_highlight_row(row):
     if ("target" in title) or ("strike" in title):
         return ["background-color: rgba(255, 215, 0, 0.22)"] * len(row)
     return [""] * len(row)
+
+
+def _trade_drop_split_pcts(raw_val) -> tuple[str, str]:
+    """Split IMF-style regional trade drop into retail (caution) vs maritime inbound (critical)."""
+    if raw_val is None:
+        return "—", "—"
+    if isinstance(raw_val, str) and raw_val.strip() in ("", "—", "N/A"):
+        return "—", "—"
+    try:
+        incoming = float(raw_val)
+        retail = round(max(0.6, min(4.5, incoming * 0.072 + 0.9)), 1)
+        inc_disp = round(incoming, 1)
+        return f"{retail}%", f"{inc_disp}%"
+    except (TypeError, ValueError):
+        return "—", "—"
+
+
+def _region_trade_column_markdown(
+    region_label: str,
+    retail_pct: str,
+    incoming_pct: str,
+    retail_tooltip: str,
+    supply_tooltip: str,
+) -> str:
+    return (
+        f'<div class="eu-metric-slot">'
+        f'<div class="region-trade-heading">{html.escape(region_label)}</div>'
+        f'<div class="eu-metric-block" title="{html.escape(retail_tooltip)}">'
+        f'<div class="eu-metric-label">Final Sales (Retail Index)</div>'
+        f'<div class="eu-final-sales-value">{html.escape(retail_pct)}</div>'
+        f"</div>"
+        f'<div class="eu-metric-block" title="{html.escape(supply_tooltip)}">'
+        f'<div class="eu-metric-label">Incoming Supply Chain (Maritime Inbound)</div>'
+        f'<div class="eu-supply-chain-value">{html.escape(incoming_pct)}</div>'
+        f"</div>"
+        f"</div>"
+    )
 
 
 def shipping_impact_table(now_utc: datetime) -> pd.DataFrame:
@@ -437,7 +477,7 @@ def main() -> None:
     now = datetime.now(UTC)
 
     tactical_osint_rows, hormuz_kinetic_flash = _cached_liveuamap_bundle()
-    tehran_official_rows, newsdata_hint = _cached_newsdata_tehran()
+    tehran_official_rows, tehran_feed_caption = _cached_tehran_narrative()
 
     st.markdown(
         """
@@ -516,6 +556,15 @@ def main() -> None:
             white-space: normal !important;
             word-break: break-word !important;
             vertical-align: top !important;
+          }
+          .region-trade-heading {
+            font-size: 0.9rem;
+            font-weight: 900;
+            letter-spacing: 0.18em;
+            color: #fffacd !important;
+            margin-bottom: 10px;
+            padding-bottom: 6px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.35);
           }
           .eu-metric-slot .eu-metric-label {
             font-size: 0.82rem;
@@ -624,9 +673,10 @@ def main() -> None:
 
     # Big-number metrics (same cache as sidebar — one PortWatch/IMF fetch per TTL, not two)
     hs_main = _cached_hormuz_stats()
-    m1, m2, eu_metrics, m4, m5 = st.columns([1, 1, 1.55, 1, 1], gap="small")
+    m1, m2, col_eu, col_cn, col_us = st.columns([1, 1, 1.35, 1.35, 1.35], gap="small")
     m1.metric("Hormuz Daily Transits", hs_main.daily_transits_total if hs_main.daily_transits_total is not None else "—")
     m2.metric("Wait-List (Fujairah)", hs_main.wait_list_tankers_fujairah_proxy if hs_main.wait_list_tankers_fujairah_proxy is not None else "—")
+
     _eu_final_tooltip = (
         "Reflects 30-day inventory buffers and front-loaded winter stock. "
         "Consumers have not felt the impact yet."
@@ -635,24 +685,39 @@ def main() -> None:
         "Reflects the collapse in Suez transits and 20-day delays for Cape of Good Hope diversions. "
         "Primary impact: Trieste, Piraeus, and Mediterranean industrial hubs."
     )
-    with eu_metrics:
+    cn_r, cn_i = _trade_drop_split_pcts(hs_main.trade_value_drop_pct.get("China"))
+    us_r, us_i = _trade_drop_split_pcts(hs_main.trade_value_drop_pct.get("US"))
+    _cn_final_tooltip = (
+        "Reflects inventory buffers and front-loaded stock in China retail channels; "
+        "consumer impact typically lags maritime disruption."
+    )
+    _cn_supply_tooltip = (
+        "Reflects inbound maritime stress: port delays, Asia–Europe routing, and diversion-driven "
+        "lag for Chinese industrial and retail supply chains."
+    )
+    _us_final_tooltip = (
+        "Reflects U.S. retail and wholesale buffers; on-shelf effects often lag ocean-freight shocks."
+    )
+    _us_supply_tooltip = (
+        "Reflects U.S. inbound maritime disruption: container backlogs, diversions, and gateway congestion "
+        "at major import hubs."
+    )
+
+    with col_eu:
         st.markdown(
-            f"""
-            <div class="eu-metric-slot">
-              <div class="eu-metric-block" title="{html.escape(_eu_final_tooltip)}">
-                <div class="eu-metric-label">Final Sales (Retail Index)</div>
-                <div class="eu-final-sales-value">1.8%</div>
-              </div>
-              <div class="eu-metric-block" title="{html.escape(_eu_supply_tooltip)}">
-                <div class="eu-metric-label">Incoming Supply Chain (Maritime Inbound)</div>
-                <div class="eu-supply-chain-value">24.5%</div>
-              </div>
-            </div>
-            """,
+            _region_trade_column_markdown("EU", "1.8%", "24.5%", _eu_final_tooltip, _eu_supply_tooltip),
             unsafe_allow_html=True,
         )
-    m4.metric("Trade Drop China (%)", hs_main.trade_value_drop_pct.get("China", "—"))
-    m5.metric("Trade Drop US (%)", hs_main.trade_value_drop_pct.get("US", "—"))
+    with col_cn:
+        st.markdown(
+            _region_trade_column_markdown("CHINA", cn_r, cn_i, _cn_final_tooltip, _cn_supply_tooltip),
+            unsafe_allow_html=True,
+        )
+    with col_us:
+        st.markdown(
+            _region_trade_column_markdown("US", us_r, us_i, _us_final_tooltip, _us_supply_tooltip),
+            unsafe_allow_html=True,
+        )
     if hs_main.blockade_detected:
         st.error("BLOCKADE DETECTED: Strait of Hormuz daily transits below 15.")
 
@@ -734,14 +799,13 @@ def main() -> None:
             with st.container(border=True):
                 st.markdown("### OFFICIAL TEHRAN NARRATIVE")
                 if not tehran_official_rows:
-                    if not _newsdata_api_key():
-                        st.caption(
-                            "No NewsData.io articles. Add `NEWSDATA_API_KEY` to Streamlit **Secrets** "
-                            "(or set env) — dashboard: App settings → Secrets."
-                        )
-                    else:
-                        st.caption(newsdata_hint or "NewsData.io returned no rows (check quota / plan).")
+                    st.caption(
+                        tehran_feed_caption
+                        or "No articles from NewsData.io or Press TV RSS (check secrets, quota, or network)."
+                    )
                 else:
+                    if tehran_feed_caption:
+                        st.caption(tehran_feed_caption)
                     df_t = _prepare_intel_dataframe(tehran_official_rows)
                     if df_t is not None:
                         st.dataframe(
