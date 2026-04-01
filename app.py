@@ -271,11 +271,6 @@ def render_tactical_alert_banner(now_utc: datetime) -> None:
         unsafe_allow_html=True,
     )
 
-    with st.expander("Target list (18 firms)", expanded=False):
-        st.write(
-            "Apple, Google, Microsoft, Meta, Nvidia, Tesla, Intel, IBM, Boeing, Dell, HP, Cisco, Oracle, JPMorgan, General Electric, Amazon, Anthropic, OpenAI."
-        )
-
 
 def _safe_float(x) -> float | None:
     try:
@@ -506,32 +501,37 @@ def render_commodity_tracker(rows: list[dict]) -> None:
 
 
 def render_market_grid(rows: list[dict]) -> None:
-    # Compact grid above the news feed.
-    st.markdown("**Targeted Firm Market Monitor**")
-    cols = st.columns(4, gap="small")
-    for i, r in enumerate(rows[:16]):
-        c = cols[i % 4]
-        t = r.get("Ticker", "—")
-        p = r.get("Price")
-        ch = r.get("% Change")
-        ch_s = "—" if ch is None else f"{ch:+.2f}%"
-        p_s = "—" if p is None else f"${p:,.2f}"
-        is_down = (ch is not None) and (ch <= -2.0)
-        label_color = "#FFFFFF"
-        num_color = "#FFFF00"
-        ch_color = "#ff3b3b" if is_down else num_color
-        bg = "rgba(255, 0, 0, 0.10)" if is_down else "rgba(255, 255, 255, 0.06)"
-        c.markdown(
-            f"""
-            <div style="border:2px solid #FFFFFF; background:{bg}; border-radius:10px; padding:10px 10px; margin-bottom:8px;">
-              <div style="display:flex; justify-content:space-between; align-items:center;">
-                <div style="font-weight:900; color:{label_color}; letter-spacing:0.10em; font-size:1rem;">{t}</div>
-                <div style="font-weight:900; color:{ch_color}; font-size:1.05rem;">{ch_s}</div>
-              </div>
-              <div style="font-weight:900; color:{num_color}; font-size:1.35rem; margin-top:6px;">{p_s}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
+    """Collapsible block: same pattern as the old target-list expander under the countdown."""
+    with st.expander("Target list (18 firms)", expanded=False):
+        cols = st.columns(4, gap="small")
+        for i, r in enumerate(rows[:16]):
+            c = cols[i % 4]
+            t = r.get("Ticker", "—")
+            p = r.get("Price")
+            ch = r.get("% Change")
+            ch_s = "—" if ch is None else f"{ch:+.2f}%"
+            p_s = "—" if p is None else f"${p:,.2f}"
+            is_down = (ch is not None) and (ch <= -2.0)
+            label_color = "#FFFFFF"
+            num_color = "#FFFF00"
+            ch_color = "#ff3b3b" if is_down else num_color
+            bg = "rgba(255, 0, 0, 0.10)" if is_down else "rgba(255, 255, 255, 0.06)"
+            c.markdown(
+                f"""
+                <div style="border:2px solid #FFFFFF; background:{bg}; border-radius:10px; padding:10px 10px; margin-bottom:8px;">
+                  <div style="display:flex; justify-content:space-between; align-items:center;">
+                    <div style="font-weight:900; color:{label_color}; letter-spacing:0.10em; font-size:1rem;">{t}</div>
+                    <div style="font-weight:900; color:{ch_color}; font-size:1.05rem;">{ch_s}</div>
+                  </div>
+                  <div style="font-weight:900; color:{num_color}; font-size:1.35rem; margin-top:6px;">{p_s}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        st.caption(
+            "Apple, Google, Microsoft, Meta, Nvidia, Tesla, Intel, IBM, Boeing, Dell, HP, Cisco, Oracle, "
+            "JPMorgan, General Electric, Amazon, Anthropic, OpenAI. "
+            "Prices: 16 tickers via Yahoo Finance (subset of the 18 named targets)."
         )
 
 
