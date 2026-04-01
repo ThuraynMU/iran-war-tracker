@@ -438,10 +438,32 @@ def _region_trade_column_markdown(
     )
 
 
-def build_tactical_war_room_map() -> folium.Map:
+def _trade_drop_bracket_color(drop_pct: float | None) -> tuple[str, float]:
+    """Green <5%, Orange 5–20%, Red >20%; returns (hex, magnitude %)."""
+    d = abs(float(drop_pct)) if drop_pct is not None else 0.0
+    if d < 5.0:
+        return "#2ee85a", d
+    if d <= 20.0:
+        return "#ff9800", d
+    return "#ff3b3b", d
+
+
+def _inventory_days_remaining(trade_drop_pct: float) -> float:
+    """UI proxy: buffer days ≈ 30 − (trade drop × 0.5)."""
+    return 30.0 - (trade_drop_pct * 0.5)
+
+
+def _hex_to_rgb_triplet(hex_color: str) -> tuple[int, int, int]:
+    h = hex_color.strip().lstrip("#")
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+
+def build_tactical_war_room_map(
+    trade_drop_pct: dict[str, float] | None = None,
+) -> folium.Map:
     """
     High-contrast tactical shipping overlay: blocked Suez corridor vs active Cape route;
-    escalation zones at Hormuz and Bab el-Mandeb.
+    escalation zones at Hormuz and Bab el-Mandeb; hub markers colored by regional trade drop.
     """
     m = folium.Map(
         location=[15.0, 45.0],
@@ -450,6 +472,55 @@ def build_tactical_war_room_map() -> folium.Map:
         attr='© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> © CARTO',
         control_scale=True,
     )
+    td = trade_drop_pct or {}
+
+    def _trade_hub_pulse_marker(
+        lat: float,
+        lon: float,
+        port_name: str,
+        region_key: str,
+        drop_raw: float | None,
+    ) -> None:
+        color_hex, d_mag = _trade_drop_bracket_color(drop_raw)
+        inv = _inventory_days_remaining(d_mag)
+        r, g, b = _hex_to_rgb_triplet(color_hex)
+        pulse_html = f"""
+<div style="width:52px;height:52px;display:flex;align-items:center;justify-content:center;">
+  <div style="
+    width:40px;height:40px;border-radius:50%;
+    background:rgba({r},{g},{b},0.48);border:3px solid {color_hex};
+    box-shadow:0 0 16px rgba({r},{g},{b},0.9);
+    animation:tradeHubPulse 1.18s ease-in-out infinite;
+  "></div>
+</div>
+<style>
+@keyframes tradeHubPulse {{
+  0%, 100% {{ transform: scale(1); opacity: 0.95; }}
+  50% {{ transform: scale(1.36); opacity: 0.45; }}
+}}
+</style>
+"""
+        tip = f"{port_name} · {region_key} trade shock ~{d_mag:.1f}%"
+        popup_body = (
+            f"<div style=\"font-family:system-ui,sans-serif;min-width:220px;color:#1a1a1a;line-height:1.45;\">"
+            f"<b>{html.escape(port_name)}</b><br/>"
+            f"<span>Region proxy: <b>{html.escape(region_key)}</b></span><br/>"
+            f"<span>Trade drop (nowcast): <b>{d_mag:.1f}%</b></span><br/>"
+            f"<span style=\"font-size:15px;\"><b>Days of inventory remaining (est.): {inv:.1f}</b></span><br/>"
+            f"<span style=\"font-size:11px;color:#555;\">Simulated: 30 − (trade drop × 0.5)</span>"
+            f"</div>"
+        )
+        folium.Marker(
+            location=[lat, lon],
+            icon=folium.DivIcon(html=pulse_html, icon_size=(52, 52), icon_anchor=(26, 26)),
+            tooltip=tip,
+            popup=folium.Popup(popup_body, max_width=300),
+        ).add_to(m)
+
+    # Rotterdam & Trieste: EU trade drop; Singapore: China (Asian entrepôt proxy)
+    _trade_hub_pulse_marker(51.9244, 4.4777, "Rotterdam", "EU", td.get("EU"))
+    _trade_hub_pulse_marker(45.6495, 13.7768, "Trieste", "EU", td.get("EU"))
+    _trade_hub_pulse_marker(1.2897, 103.8501, "Singapore", "China", td.get("China"))
 
     def _pulse_marker(lat: float, lon: float) -> None:
         html = """
@@ -1243,7 +1314,7 @@ def main() -> None:
             "Suez corridor assessed blocked under high kinetic risk; Cape of Good Hope diversion is the active lane (+~20 days)."
         )
     streamlit_folium.st_folium(
-        build_tactical_war_room_map(),
+        build_tactical_war_room_map(hs_main.trade_value_drop_pct),
         use_container_width=True,
         height=460,
         returned_objects=[],
