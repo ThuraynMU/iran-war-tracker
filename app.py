@@ -150,6 +150,28 @@ def _trade_drop_split_pcts(raw_val) -> tuple[str, str]:
         return "—", "—"
 
 
+FUJAIRAH_QUEUE_STATUS = "CRITICAL CONGESTION / FORCE MAJEURE"
+FUJAIRAH_AIS_NOTE = (
+    "Note: AIS signal interference (NAVWARN 01/2026) active in Fujairah offshore waters. "
+    "Real-time vessel counts are currently unreliable."
+)
+
+
+def _fujairah_waitlist_display_value(raw) -> str:
+    """Override: low reported counts reflect AIS jamming, not true queue depth."""
+    if raw is None:
+        return "—"
+    try:
+        n = float(raw)
+    except (TypeError, ValueError):
+        return str(raw)
+    if n < 10:
+        return "SIGNAL BLOCKED · EST: 100+"
+    if n == int(n):
+        return str(int(n))
+    return str(n)
+
+
 def _region_trade_column_markdown(
     region_label: str,
     retail_pct: str,
@@ -802,7 +824,11 @@ def main() -> None:
         hs = _cached_hormuz_stats()
         st.write(f"**As-of (UTC):** {hs.asof_date_utc.strftime('%Y-%m-%d') if hs.asof_date_utc else '—'}")
         st.write(f"**Daily Transits:** {hs.daily_transits_total if hs.daily_transits_total is not None else '—'}")
-        st.write(f"**Wait-List (Fujairah proxy):** {hs.wait_list_tankers_fujairah_proxy if hs.wait_list_tankers_fujairah_proxy is not None else '—'}")
+        st.write(
+            f"**Wait-List (Fujairah proxy):** {_fujairah_waitlist_display_value(hs.wait_list_tankers_fujairah_proxy)}"
+        )
+        st.markdown(f"**{FUJAIRAH_QUEUE_STATUS}**")
+        st.caption(FUJAIRAH_AIS_NOTE)
         if hs.trade_value_drop_pct:
             st.write("**Trade Value Drop (%):**")
             for k in ["EU", "China", "US"]:
@@ -819,7 +845,13 @@ def main() -> None:
     hs_main = _cached_hormuz_stats()
     m1, m2, col_eu, col_cn, col_us = st.columns([1, 1, 1.35, 1.35, 1.35], gap="small")
     m1.metric("Hormuz Daily Transits", hs_main.daily_transits_total if hs_main.daily_transits_total is not None else "—")
-    m2.metric("Wait-List (Fujairah)", hs_main.wait_list_tankers_fujairah_proxy if hs_main.wait_list_tankers_fujairah_proxy is not None else "—")
+    with m2:
+        st.markdown(f"**{FUJAIRAH_QUEUE_STATUS}**")
+        st.metric(
+            "Wait-List (Fujairah)",
+            _fujairah_waitlist_display_value(hs_main.wait_list_tankers_fujairah_proxy),
+        )
+        st.warning(FUJAIRAH_AIS_NOTE)
 
     _eu_final_tooltip = (
         "Negative % = trade / demand deficit vs baseline. Reflects 30-day inventory buffers and "
