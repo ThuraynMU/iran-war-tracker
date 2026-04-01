@@ -236,7 +236,7 @@ def recent_kinetic_strike_osint_titles(rows: list[dict], *, limit: int = 5) -> l
 
 
 def render_osint_kinetic_marquee(rows: list[dict]) -> None:
-    """Bottom-of-page scrolling ticker: kinetic/strike lines from LiveUAMap / Google OSINT bundle."""
+    """Top-of-page scrolling ticker: kinetic/strike lines from LiveUAMap / Google OSINT bundle."""
     titles = recent_kinetic_strike_osint_titles(rows, limit=5)
     sep = "    •    "
     if not titles:
@@ -250,10 +250,11 @@ def render_osint_kinetic_marquee(rows: list[dict]) -> None:
           <style>
             .osint-marquee-wrap {{
               background: #000000;
-              border-top: 2px solid #3d3d3d;
+              border-bottom: 2px solid #3d3d3d;
               overflow: hidden;
-              padding: 14px 0;
-              margin-top: 12px;
+              padding: 10px 0;
+              margin-top: 0;
+              margin-bottom: 4px;
             }}
             .osint-marquee-track {{
               display: flex;
@@ -398,6 +399,20 @@ def _trade_drop_split_pcts(raw_val) -> tuple[str, str]:
         return "—", "—"
 
 
+def _incoming_supply_chain_drop_numeric(region_api_key: str, trade_drop_pct: dict[str, float] | None) -> float:
+    """
+    Positive % magnitude for map / supply-chain stress — matches
+    "Incoming Supply Chain (Maritime Inbound)" not retail.
+    EU uses the same fixed presentation as the EU trade column (24.5).
+    """
+    if region_api_key == "EU":
+        return 24.5
+    v = (trade_drop_pct or {}).get(region_api_key)
+    if v is None:
+        return 0.0
+    return round(abs(float(v)), 1)
+
+
 FUJAIRAH_QUEUE_STATUS = "CRITICAL CONGESTION / FORCE MAJEURE"
 
 
@@ -448,9 +463,9 @@ def _trade_drop_bracket_color(drop_pct: float | None) -> tuple[str, float]:
     return "#ff3b3b", d
 
 
-def _inventory_days_remaining(trade_drop_pct: float) -> float:
-    """UI proxy: buffer days ≈ 30 − (trade drop × 0.5)."""
-    return 30.0 - (trade_drop_pct * 0.5)
+def _inventory_days_remaining(supply_chain_shock_pct: float) -> float:
+    """UI proxy: buffer days ≈ 30 − (incoming supply-chain shock % × 0.5)."""
+    return 30.0 - (supply_chain_shock_pct * 0.5)
 
 
 def _hex_to_rgb_triplet(hex_color: str) -> tuple[int, int, int]:
@@ -463,7 +478,7 @@ def build_tactical_war_room_map(
 ) -> folium.Map:
     """
     High-contrast tactical shipping overlay: blocked Suez corridor vs active Cape route;
-    escalation zones at Hormuz and Bab el-Mandeb; hub markers colored by regional trade drop.
+    escalation zones at Hormuz and Bab el-Mandeb; hub markers colored by incoming supply-chain shock.
     """
     m = folium.Map(
         location=[15.0, 45.0],
@@ -479,9 +494,9 @@ def build_tactical_war_room_map(
         lon: float,
         port_name: str,
         region_key: str,
-        drop_raw: float | None,
+        supply_chain_pct: float | None,
     ) -> None:
-        color_hex, d_mag = _trade_drop_bracket_color(drop_raw)
+        color_hex, d_mag = _trade_drop_bracket_color(supply_chain_pct)
         inv = _inventory_days_remaining(d_mag)
         r, g, b = _hex_to_rgb_triplet(color_hex)
         pulse_html = f"""
@@ -500,14 +515,14 @@ def build_tactical_war_room_map(
 }}
 </style>
 """
-        tip = f"{port_name} · {region_key} trade shock ~{d_mag:.1f}%"
+        tip = f"{port_name} · {region_key} inbound supply shock ~{d_mag:.1f}%"
         popup_body = (
             f"<div style=\"font-family:system-ui,sans-serif;min-width:220px;color:#1a1a1a;line-height:1.45;\">"
             f"<b>{html.escape(port_name)}</b><br/>"
             f"<span>Region proxy: <b>{html.escape(region_key)}</b></span><br/>"
-            f"<span>Trade drop (nowcast): <b>{d_mag:.1f}%</b></span><br/>"
+            f"<span>Incoming supply chain (maritime inbound): <b>{d_mag:.1f}%</b></span><br/>"
             f"<span style=\"font-size:15px;\"><b>Days of inventory remaining (est.): {inv:.1f}</b></span><br/>"
-            f"<span style=\"font-size:11px;color:#555;\">Simulated: 30 − (trade drop × 0.5)</span>"
+            f"<span style=\"font-size:11px;color:#555;\">Simulated: 30 − (supply-chain shock % × 0.5)</span>"
             f"</div>"
         )
         folium.Marker(
@@ -517,10 +532,16 @@ def build_tactical_war_room_map(
             popup=folium.Popup(popup_body, max_width=300),
         ).add_to(m)
 
-    # Rotterdam & Trieste: EU trade drop; Singapore: China (Asian entrepôt proxy)
-    _trade_hub_pulse_marker(51.9244, 4.4777, "Rotterdam", "EU", td.get("EU"))
-    _trade_hub_pulse_marker(45.6495, 13.7768, "Trieste", "EU", td.get("EU"))
-    _trade_hub_pulse_marker(1.2897, 103.8501, "Singapore", "China", td.get("China"))
+    # Rotterdam / Trieste: EU inbound supply-chain magnitude; Singapore: China proxy
+    _trade_hub_pulse_marker(
+        51.9244, 4.4777, "Rotterdam", "EU", _incoming_supply_chain_drop_numeric("EU", td)
+    )
+    _trade_hub_pulse_marker(
+        45.6495, 13.7768, "Trieste", "EU", _incoming_supply_chain_drop_numeric("EU", td)
+    )
+    _trade_hub_pulse_marker(
+        1.2897, 103.8501, "Singapore", "China", _incoming_supply_chain_drop_numeric("China", td)
+    )
 
     def _pulse_marker(lat: float, lon: float) -> None:
         html = """
@@ -1029,21 +1050,7 @@ def main() -> None:
     bgri_live_entries = _cached_live_entries()
 
     st.markdown(
-        '<div style="height:1.35rem" aria-hidden="true"></div>',
-        unsafe_allow_html=True,
-    )
-    _top_pad, _top_refresh = st.columns([6, 1], gap="small")
-    with _top_refresh:
-        if st.button(
-            "🔄 Manual Refresh",
-            use_container_width=True,
-            key="manual_refresh_top_right",
-            help="Clear cached RSS, news, and market data and rerun",
-        ):
-            st.cache_data.clear()
-            st.rerun()
-    st.markdown(
-        '<div style="height:0.85rem" aria-hidden="true"></div>',
+        '<div style="height:0.35rem" aria-hidden="true"></div>',
         unsafe_allow_html=True,
     )
 
@@ -1187,6 +1194,25 @@ def main() -> None:
             unsafe_allow_html=True,
         )
 
+    render_osint_kinetic_marquee(tactical_osint_rows)
+
+    _top_pad, _top_refresh = st.columns([7, 1], gap="small")
+    with _top_refresh:
+        if st.button(
+            "🔄 Manual Refresh",
+            use_container_width=True,
+            key="manual_refresh_top_right",
+            help="Clear cached RSS, news, and market data and rerun",
+        ):
+            st.cache_data.clear()
+            st.rerun()
+    st.markdown(
+        '<div style="height:0.15rem" aria-hidden="true"></div>',
+        unsafe_allow_html=True,
+    )
+
+    render_tactical_alert_banner(now)
+
     with st.sidebar:
         st.subheader("Market Watch")
 
@@ -1239,8 +1265,6 @@ def main() -> None:
             st.error("BLOCKADE DETECTED (Daily transits < 15)")
         for n in hs.notes:
             st.caption(n)
-
-    render_tactical_alert_banner(now)
 
     _bgri = compute_bgri(bgri_live_entries, tehran_official_rows, tactical_osint_rows)
     render_bgri_attention_gauge(_bgri)
@@ -1455,8 +1479,6 @@ def main() -> None:
                     st.warning("Waiting for news sync...")
             else:
                 st.warning("No RSS entries were fetched.")
-
-    render_osint_kinetic_marquee(tactical_osint_rows)
 
 
 if __name__ == "__main__":
