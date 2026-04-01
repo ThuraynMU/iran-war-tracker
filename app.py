@@ -604,6 +604,10 @@ def main() -> None:
     tactical_osint_rows, hormuz_kinetic_flash = _cached_liveuamap_bundle()
     tehran_official_rows, tehran_feed_caption = _cached_tehran_narrative()
 
+    st.markdown(
+        '<div style="height:1.35rem" aria-hidden="true"></div>',
+        unsafe_allow_html=True,
+    )
     _top_pad, _top_refresh = st.columns([6, 1], gap="small")
     with _top_refresh:
         if st.button(
@@ -614,6 +618,10 @@ def main() -> None:
         ):
             st.cache_data.clear()
             st.rerun()
+    st.markdown(
+        '<div style="height:0.85rem" aria-hidden="true"></div>',
+        unsafe_allow_html=True,
+    )
 
     st.markdown(
         """
