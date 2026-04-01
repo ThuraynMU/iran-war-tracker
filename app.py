@@ -670,11 +670,25 @@ WAR_ROOM_SUEZ_BLOCKED_ROUTE_LL: list[list[float]] = [
     [29.9, 32.5],
     [45.6, 13.7],
 ]
+# Asia → Malacca same as Suez branch; Cape → Rotterdam uses Atlantic waypoints (vessel track
+# off West Africa, not a single great-circle chord across the ocean).
 WAR_ROOM_CAPE_ACTIVE_ROUTE_LL: list[list[float]] = [
     [31.2, 121.5],
     [22.5, 113.9],
     [1.3, 103.8],
     [-34.4, 18.5],
+    [-29.5, 16.5],
+    [-22.0, 13.0],
+    [-12.5, 10.5],
+    [-3.0, 8.5],
+    [5.5, 4.0],
+    [11.5, -2.5],
+    [16.5, -10.0],
+    [22.0, -17.5],
+    [30.0, -18.5],
+    [38.0, -12.0],
+    [45.0, -6.5],
+    [50.0, -1.5],
     [51.9, 3.9],
 ]
 WAR_ROOM_CONFLICT_BRANCH_LL: list[list[float]] = [
@@ -817,8 +831,8 @@ def build_tactical_war_room_map(
         weight=5,
         opacity=0.9,
         tooltip=folium.Tooltip(
-            "ACTIVE CAPE ROUTE — Shanghai → Shenzhen → Malacca → Cape of Good Hope → "
-            "Port of Rotterdam",
+            "ACTIVE CAPE ROUTE — via Cape of Good Hope, South Atlantic off West Africa, "
+            "North Atlantic & English Channel → Rotterdam",
             sticky=True,
         ),
     ).add_to(m)
