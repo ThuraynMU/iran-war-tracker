@@ -9,11 +9,14 @@ from email.utils import parsedate_to_datetime
 
 import folium
 import pandas as pd
+import requests
 import streamlit as st
 import streamlit_folium
 from streamlit_autorefresh import st_autorefresh
 import yfinance as yf
 import time
+
+from branca.element import Element
 
 from logic import (
     RELIABILITY_BUFFER_DAYS,
@@ -468,9 +471,165 @@ def _inventory_days_remaining(supply_chain_shock_pct: float) -> float:
     return 30.0 - (supply_chain_shock_pct * 0.5)
 
 
-def _hex_to_rgb_triplet(hex_color: str) -> tuple[int, int, int]:
-    h = hex_color.strip().lstrip("#")
-    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+NE_50M_COUNTRIES_GEOJSON_URL = (
+    "https://d2ad6b4ur7yvpq.cloudfront.net/naturalearth-3.3.0/ne_50m_admin_0_countries.geojson"
+)
+
+# Natural Earth ADM0_A3 — EU-27 (post-Brexit), for outline overlay
+EU27_ADM0_A3: frozenset[str] = frozenset(
+    {
+        "AUT",
+        "BEL",
+        "BGR",
+        "HRV",
+        "CYP",
+        "CZE",
+        "DNK",
+        "EST",
+        "FIN",
+        "FRA",
+        "DEU",
+        "GRC",
+        "HUN",
+        "IRL",
+        "ITA",
+        "LVA",
+        "LTU",
+        "LUX",
+        "MLT",
+        "NLD",
+        "POL",
+        "PRT",
+        "ROU",
+        "SVK",
+        "SVN",
+        "ESP",
+        "SWE",
+    }
+)
+
+
+@st.cache_data(ttl=86_400, show_spinner=False)
+def _cached_natural_earth_50m_countries() -> dict | None:
+    try:
+        r = requests.get(NE_50M_COUNTRIES_GEOJSON_URL, timeout=35)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("type") != "FeatureCollection":
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def _geojson_feature_subset(full: dict | None, iso_codes: frozenset[str]) -> dict:
+    if not full or not iso_codes:
+        return {"type": "FeatureCollection", "features": []}
+    feats: list[dict] = []
+    for f in full.get("features", []):
+        if not isinstance(f, dict):
+            continue
+        p = f.get("properties") or {}
+        iso = str(p.get("ADM0_A3") or p.get("ISO_A3") or "")
+        if iso in iso_codes:
+            feats.append(f)
+    return {"type": "FeatureCollection", "features": feats}
+
+
+def _war_room_leaflet_contrast_css() -> str:
+    """Dark tooltip / popup chrome for Carto dark tiles + iPad."""
+    return """
+        <style>
+        .leaflet-tooltip {
+          background: #0a0a0a !important;
+          background-color: #0a0a0a !important;
+          border: 2px solid #ffff00 !important;
+          color: #ffff00 !important;
+          font-weight: 700 !important;
+          font-family: ui-monospace, Menlo, Monaco, Consolas, monospace !important;
+          font-size: 13px !important;
+          padding: 8px 12px !important;
+          box-shadow: 0 0 14px rgba(255, 255, 0, 0.35) !important;
+        }
+        .leaflet-tooltip-top:before,
+        .leaflet-tooltip-bottom:before,
+        .leaflet-tooltip-left:before,
+        .leaflet-tooltip-right:before {
+          border-top-color: #ffff00 !important;
+        }
+        .leaflet-popup-content-wrapper {
+          background: #101010 !important;
+          color: #ffffff !important;
+          border: 2px solid #ffff00 !important;
+          border-radius: 10px !important;
+        }
+        .leaflet-popup-tip {
+          background: #101010 !important;
+          border: 1px solid #ffff00 !important;
+          box-shadow: none !important;
+        }
+        .leaflet-popup-content {
+          margin: 12px 14px !important;
+          font-size: 14px !important;
+          line-height: 1.45 !important;
+          color: #ffffff !important;
+        }
+        </style>
+        """
+
+
+def _port_detail_popup_html(
+    port_name: str,
+    incoming_supply_drop_display: str,
+    status: str,
+    inv_days_est: float,
+) -> str:
+    """Click target: rich panel-style popup (high contrast)."""
+    return (
+        f'<div style="font-family:system-ui,ui-monospace,Menlo,monospace;">'
+        f'<h3 style="color:#ffff00;margin:0 0 10px 0;font-size:17px;letter-spacing:0.03em;">'
+        f"{html.escape(port_name)}</h3>"
+        f'<p style="margin:5px 0;"><span style="color:#c8c8c8;">Incoming supply drop:</span> '
+        f'<b style="color:#ffff00;">{html.escape(incoming_supply_drop_display)}</b></p>'
+        f'<p style="margin:5px 0;"><span style="color:#c8c8c8;">Status:</span> '
+        f'<b style="color:#ffffff;">{html.escape(status)}</b></p>'
+        f'<p style="margin:12px 0 0 0;font-size:12px;color:#aaaaaa;">'
+        f'Est. days of inventory remaining: <b style="color:#ffff00;">{inv_days_est:.1f}</b> '
+        f"(30 − 0.5 × |shock|)</p>"
+        f'<p style="margin:8px 0 0 0;font-size:11px;color:#777;">Close: tap ✕ or map outside.</p>'
+        f"</div>"
+    )
+
+
+def _add_trade_port_circle_marker(
+    m: folium.Map,
+    *,
+    lat: float,
+    lon: float,
+    port_name: str,
+    supply_shock_mag: float,
+    status: str,
+) -> None:
+    color_hex, d_mag = _trade_drop_bracket_color(supply_shock_mag)
+    inv = _inventory_days_remaining(d_mag)
+    pct_disp = f"-{d_mag:.1f}%"
+    tip = (
+        f"{port_name}\nIncoming supply drop: {pct_disp}\nStatus: {status}"
+    )
+    folium.CircleMarker(
+        location=[lat, lon],
+        radius=12,
+        color=color_hex,
+        weight=3,
+        fill=True,
+        fillColor=color_hex,
+        fillOpacity=0.42,
+        popup=folium.Popup(
+            _port_detail_popup_html(port_name, pct_disp, status, inv),
+            max_width=340,
+        ),
+        tooltip=folium.Tooltip(tip, sticky=True),
+    ).add_to(m)
 
 
 def build_tactical_war_room_map(
@@ -488,59 +647,77 @@ def build_tactical_war_room_map(
         control_scale=True,
     )
     td = trade_drop_pct or {}
+    m.get_root().header.add_child(Element(_war_room_leaflet_contrast_css()))
 
-    def _trade_hub_pulse_marker(
-        lat: float,
-        lon: float,
-        port_name: str,
-        region_key: str,
-        supply_chain_pct: float | None,
-    ) -> None:
-        color_hex, d_mag = _trade_drop_bracket_color(supply_chain_pct)
-        inv = _inventory_days_remaining(d_mag)
-        r, g, b = _hex_to_rgb_triplet(color_hex)
-        pulse_html = f"""
-<div style="width:52px;height:52px;display:flex;align-items:center;justify-content:center;">
-  <div style="
-    width:40px;height:40px;border-radius:50%;
-    background:rgba({r},{g},{b},0.48);border:3px solid {color_hex};
-    box-shadow:0 0 16px rgba({r},{g},{b},0.9);
-    animation:tradeHubPulse 1.18s ease-in-out infinite;
-  "></div>
-</div>
-<style>
-@keyframes tradeHubPulse {{
-  0%, 100% {{ transform: scale(1); opacity: 0.95; }}
-  50% {{ transform: scale(1.36); opacity: 0.45; }}
-}}
-</style>
-"""
-        tip = f"{port_name} · {region_key} inbound supply shock ~{d_mag:.1f}%"
-        popup_body = (
-            f"<div style=\"font-family:system-ui,sans-serif;min-width:220px;color:#1a1a1a;line-height:1.45;\">"
-            f"<b>{html.escape(port_name)}</b><br/>"
-            f"<span>Region proxy: <b>{html.escape(region_key)}</b></span><br/>"
-            f"<span>Incoming supply chain (maritime inbound): <b>{d_mag:.1f}%</b></span><br/>"
-            f"<span style=\"font-size:15px;\"><b>Days of inventory remaining (est.): {inv:.1f}</b></span><br/>"
-            f"<span style=\"font-size:11px;color:#555;\">Simulated: 30 − (supply-chain shock % × 0.5)</span>"
-            f"</div>"
-        )
-        folium.Marker(
-            location=[lat, lon],
-            icon=folium.DivIcon(html=pulse_html, icon_size=(52, 52), icon_anchor=(26, 26)),
-            tooltip=tip,
-            popup=folium.Popup(popup_body, max_width=300),
+    ne = _cached_natural_earth_50m_countries()
+    china_gj = _geojson_feature_subset(ne, frozenset({"CHN"}))
+    eu_gj = _geojson_feature_subset(ne, EU27_ADM0_A3)
+
+    cn_mag = _incoming_supply_chain_drop_numeric("China", td)
+    eu_mag = _incoming_supply_chain_drop_numeric("EU", td)
+    china_rollover = f"Total China Trade Drop: -{cn_mag:.1f}%"
+    eu_rollover = f"Total EU Supply Chain Drop: -{eu_mag:.1f}%"
+
+    if china_gj.get("features"):
+        folium.GeoJson(
+            data=china_gj,
+            name="China trade overlay",
+            style_function=lambda _: {
+                "fillColor": "#ff8800",
+                "color": "#ffcc00",
+                "weight": 1.2,
+                "fillOpacity": 0.12,
+            },
+            highlight_function=lambda _: {"fillOpacity": 0.24, "weight": 2},
+            tooltip=folium.Tooltip(china_rollover, sticky=True),
         ).add_to(m)
 
-    # Rotterdam / Trieste: EU inbound supply-chain magnitude; Singapore: China proxy
-    _trade_hub_pulse_marker(
-        51.9244, 4.4777, "Rotterdam", "EU", _incoming_supply_chain_drop_numeric("EU", td)
+    if eu_gj.get("features"):
+        folium.GeoJson(
+            data=eu_gj,
+            name="EU supply overlay",
+            style_function=lambda _: {
+                "fillColor": "#3366dd",
+                "color": "#99ccff",
+                "weight": 1.1,
+                "fillOpacity": 0.09,
+            },
+            highlight_function=lambda _: {"fillOpacity": 0.22, "weight": 2},
+            tooltip=folium.Tooltip(eu_rollover, sticky=True),
+        ).add_to(m)
+
+    # Supply-chain hubs — CircleMarker (hover = summary; click = detail “panel” popup)
+    _add_trade_port_circle_marker(
+        m,
+        lat=31.32,
+        lon=121.75,
+        port_name="Port of Shanghai",
+        supply_shock_mag=cn_mag,
+        status="BACKLOG / QUEUE STRESS",
     )
-    _trade_hub_pulse_marker(
-        45.6495, 13.7768, "Trieste", "EU", _incoming_supply_chain_drop_numeric("EU", td)
+    _add_trade_port_circle_marker(
+        m,
+        lat=22.5,
+        lon=113.87,
+        port_name="Shenzhen Bay Port",
+        supply_shock_mag=cn_mag,
+        status="PEARL DELTA CAPACITY PRESSURE",
     )
-    _trade_hub_pulse_marker(
-        1.2897, 103.8501, "Singapore", "China", _incoming_supply_chain_drop_numeric("China", td)
+    _add_trade_port_circle_marker(
+        m,
+        lat=51.9244,
+        lon=4.4777,
+        port_name="Port of Rotterdam",
+        supply_shock_mag=eu_mag,
+        status="CONGESTED",
+    )
+    _add_trade_port_circle_marker(
+        m,
+        lat=45.6495,
+        lon=13.7768,
+        port_name="Port of Trieste",
+        supply_shock_mag=eu_mag,
+        status="SUEZ-DEPENDENT ALERT",
     )
 
     def _pulse_marker(lat: float, lon: float) -> None:
