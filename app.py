@@ -97,7 +97,9 @@ def _cached_tehran_narrative():
     )
 
 
-def _prepare_intel_dataframe(entries: list[dict]) -> pd.DataFrame | None:
+def _prepare_intel_dataframe(
+    entries: list[dict], *, include_time_column: bool = True
+) -> pd.DataFrame | None:
     if not entries:
         return None
     df_news = pd.DataFrame(entries)
@@ -105,7 +107,7 @@ def _prepare_intel_dataframe(entries: list[dict]) -> pd.DataFrame | None:
         return None
     for col in ["Date/Time (UTC)", "Source", "Title", "Link"]:
         if col not in df_news.columns:
-            df_news[col] = "N/A"
+            df_news[col] = "" if col == "Date/Time (UTC)" else "N/A"
     raw_dt = df_news["Date/Time (UTC)"].astype(str)
     cleaned = raw_dt.str.replace(" GMT", "", regex=False).str.strip()
     _dt = pd.to_datetime(
@@ -117,8 +119,11 @@ def _prepare_intel_dataframe(entries: list[dict]) -> pd.DataFrame | None:
     if _dt.isna().all():
         _dt = pd.to_datetime(raw_dt, errors="coerce", utc=True)
     df_news = df_news.assign(_dt=_dt).sort_values(by="_dt", ascending=False).reset_index(drop=True)
-    df_news["Date/Time (UTC)"] = df_news["_dt"].dt.strftime("%H:%M GMT").fillna("N/A")
-    df_news = df_news.drop(columns=["_dt"])
+    if include_time_column:
+        df_news["Date/Time (UTC)"] = df_news["_dt"].dt.strftime("%H:%M GMT").fillna("")
+        df_news = df_news.drop(columns=["_dt"])
+    else:
+        df_news = df_news.drop(columns=["_dt", "Date/Time (UTC)"])
     df_news.insert(0, "No.", range(1, len(df_news) + 1))
     return df_news
 
@@ -794,6 +799,9 @@ def main() -> None:
             "Source": st.column_config.TextColumn("Source", width="small"),
             "Link": st.column_config.LinkColumn("Article", display_text="View Source", help="Open original article"),
         }
+        link_cols_no_time = {
+            k: v for k, v in link_cols.items() if k != "Date/Time (UTC)"
+        }
 
         pane_l, pane_r = st.columns([1, 1], gap="medium")
         with pane_l:
@@ -807,15 +815,27 @@ def main() -> None:
                 else:
                     if tehran_feed_caption:
                         st.caption(tehran_feed_caption)
-                    df_t = _prepare_intel_dataframe(tehran_official_rows)
+                    df_t = _prepare_intel_dataframe(
+                        tehran_official_rows, include_time_column=False
+                    )
                     if df_t is not None:
+                        # Fresh 4-column frame so deployed UI cannot resurrect a hidden Time
+                        # column from widget state; column_order pins visible cols.
+                        df_show = pd.DataFrame(
+                            {
+                                "No.": df_t["No."].astype(int),
+                                "Source": df_t["Source"].astype(str),
+                                "Title": df_t["Title"].astype(str),
+                                "Link": df_t["Link"].astype(str),
+                            }
+                        )
                         st.dataframe(
-                            df_t[["No.", "Date/Time (UTC)", "Source", "Title", "Link"]].style.apply(
-                                _intel_highlight_row, axis=1
-                            ),
+                            df_show.style.apply(_intel_highlight_row, axis=1),
                             use_container_width=True,
                             hide_index=True,
-                            column_config=link_cols,
+                            column_config=link_cols_no_time,
+                            column_order=["No.", "Source", "Title", "Link"],
+                            key="official_tehran_narrative",
                         )
         with pane_r:
             with st.container(border=True):
@@ -835,6 +855,7 @@ def main() -> None:
                             use_container_width=True,
                             hide_index=True,
                             column_config=link_cols,
+                            key="kinetic_osint_intel",
                         )
 
         with st.container(border=True):
@@ -849,6 +870,7 @@ def main() -> None:
                         use_container_width=True,
                         hide_index=True,
                         column_config=link_cols,
+                        key="aggregated_news_intel",
                     )
                 else:
                     st.warning("Waiting for news sync...")

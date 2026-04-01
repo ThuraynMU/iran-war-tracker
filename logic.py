@@ -92,6 +92,21 @@ def _normalized_entry(*, dt: str, source: str, title: str, link: str) -> dict[st
     }
 
 
+_RE_PRESSTV_DETAIL = re.compile(r"presstv\.ir/Detail/(\d{4})/(\d{2})/(\d{2})/", re.IGNORECASE)
+
+
+def _utc_datetime_from_presstv_detail_link(link: str) -> datetime | None:
+    """Press TV RSS often omits item pubDate; article URLs embed /Detail/YYYY/MM/DD/."""
+    m = _RE_PRESSTV_DETAIL.search(link or "")
+    if not m:
+        return None
+    try:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        return datetime(y, mo, d, 12, 0, 0, tzinfo=UTC)
+    except ValueError:
+        return None
+
+
 def _parse_header_date_ts(label: str) -> float:
     """RFC 2822 / RSS pubDate → sortable unix timestamp (UTC)."""
     s = (label or "").strip()
@@ -106,7 +121,7 @@ def _parse_header_date_ts(label: str) -> float:
         return float("-inf")
 
 
-def _published_ts_from_feed_entry(e: Any) -> float:
+def _published_ts_from_feed_entry(e: Any, link: str = "") -> float:
     t = getattr(e, "published_parsed", None) or getattr(e, "updated_parsed", None)
     if t and getattr(t, "tm_year", 0) > 1990:
         try:
@@ -114,7 +129,13 @@ def _published_ts_from_feed_entry(e: Any) -> float:
         except (TypeError, ValueError, OverflowError):
             pass
     lbl = (getattr(e, "published", "") or getattr(e, "updated", "") or "").strip()
-    return _parse_header_date_ts(lbl)
+    ts = _parse_header_date_ts(lbl)
+    if ts > float("-inf"):
+        return ts
+    dt_link = _utc_datetime_from_presstv_detail_link(link)
+    if dt_link is not None:
+        return dt_link.timestamp()
+    return float("-inf")
 
 
 def _row_matches_intel_focus(row: dict[str, str]) -> bool:
@@ -192,10 +213,24 @@ def fetch_live_rss_entries(
         raw_title = (getattr(e, "title", "") or "").strip()
         link = (getattr(e, "link", "") or "").strip()
 
-        # Use entry.published string when present (as requested).
+        # Prefer RSS/Atom text dates; many feeds (e.g. some Press TV items) omit the string
+        # but feedparser still fills published_parsed / updated_parsed for sorting/UI.
         dt_label = (getattr(e, "published", "") or "").strip()
         if not dt_label:
             dt_label = (getattr(e, "updated", "") or "").strip()
+        if not dt_label:
+            t_struct = getattr(e, "published_parsed", None) or getattr(e, "updated_parsed", None)
+            if t_struct and getattr(t_struct, "tm_year", 0) > 1990:
+                try:
+                    dt_label = datetime.fromtimestamp(timegm(t_struct), tz=UTC).strftime(
+                        "%a, %d %b %Y %H:%M:%S GMT"
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    pass
+        if not dt_label:
+            dt_utc = _utc_datetime_from_presstv_detail_link(link)
+            if dt_utc is not None:
+                dt_label = dt_utc.strftime("%a, %d %b %Y %H:%M:%S GMT")
 
         source = "Google News"
         title = raw_title
@@ -208,7 +243,7 @@ def fetch_live_rss_entries(
             if publisher:
                 source = publisher
         if title or source or link or dt_label:
-            ts = _published_ts_from_feed_entry(e)
+            ts = _published_ts_from_feed_entry(e, link)
             scored.append((ts, _normalized_entry(dt=dt_label, source=source, title=title, link=link)))
     scored.sort(key=lambda x: x[0], reverse=True)
     return [row for _, row in scored[: max(0, limit)]]
