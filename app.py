@@ -4,8 +4,10 @@ import html
 import os
 from datetime import UTC, datetime, timedelta
 
+import folium
 import pandas as pd
 import streamlit as st
+import streamlit_folium
 from streamlit_autorefresh import st_autorefresh
 import yfinance as yf
 import time
@@ -188,6 +190,92 @@ def _region_trade_column_markdown(
         f"</div>"
         f"</div>"
     )
+
+
+def build_tactical_war_room_map() -> folium.Map:
+    """
+    High-contrast tactical shipping overlay: blocked Suez corridor vs active Cape route;
+    escalation zones at Hormuz and Bab el-Mandeb.
+    """
+    m = folium.Map(
+        location=[15.0, 45.0],
+        zoom_start=4,
+        tiles="CartoDB dark_matter",
+        attr='© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> © CARTO',
+        control_scale=True,
+    )
+
+    def _pulse_marker(lat: float, lon: float) -> None:
+        html = """
+<div style="width:52px;height:52px;display:flex;align-items:center;justify-content:center;">
+  <div style="
+    width:40px;height:40px;border-radius:50%;
+    background:rgba(255,30,30,0.45);border:3px solid #ff2222;
+    box-shadow:0 0 18px rgba(255,40,40,0.95);
+    animation:warroomPulse 1.15s ease-in-out infinite;
+  "></div>
+</div>
+<style>
+@keyframes warroomPulse {
+  0%, 100% { transform: scale(1); opacity: 0.95; }
+  50% { transform: scale(1.38); opacity: 0.42; }
+}
+</style>
+"""
+        folium.Marker(
+            location=[lat, lon],
+            icon=folium.DivIcon(html=html, icon_size=(52, 52), icon_anchor=(26, 26)),
+            tooltip="ZONE OF ESCALATION",
+        ).add_to(m)
+
+    # Strait of Hormuz / Bab el-Mandeb — kinetic cue
+    _pulse_marker(26.72, 56.08)
+    _pulse_marker(12.59, 43.34)
+
+    suez_route: list[list[float]] = [
+        [1.29, 103.85],
+        [5.5, 100.0],
+        [6.0, 80.0],
+        [10.5, 62.0],
+        [12.59, 43.34],
+        [20.0, 38.5],
+        [29.9, 32.55],
+        [35.5, 23.0],
+        [41.5, 12.0],
+        [47.0, 6.0],
+        [51.92, 4.48],
+    ]
+    folium.PolyLine(
+        locations=suez_route,
+        color="#ff1a1a",
+        weight=5,
+        opacity=0.92,
+        tooltip="SUEZ CANAL: BLOCKED (HIGH KINETIC RISK)",
+    ).add_to(m)
+
+    cape_route: list[list[float]] = [
+        [1.29, 103.85],
+        [-4.0, 92.0],
+        [-18.0, 78.0],
+        [-32.0, 58.0],
+        [-40.0, 32.0],
+        [-34.36, 18.5],
+        [-28.0, 8.0],
+        [-15.0, -4.0],
+        [2.0, -18.0],
+        [42.0, -12.0],
+        [51.0, -4.0],
+        [51.92, 4.48],
+    ]
+    folium.PolyLine(
+        locations=cape_route,
+        color="#00e8ff",
+        weight=5,
+        opacity=0.9,
+        tooltip="ACTIVE ROUTE: +20 DAYS DELAY",
+    ).add_to(m)
+
+    return m
 
 
 def shipping_impact_table(now_utc: datetime) -> pd.DataFrame:
@@ -891,6 +979,26 @@ def main() -> None:
         )
     if hs_main.blockade_detected:
         st.error("BLOCKADE DETECTED: Strait of Hormuz daily transits below 15.")
+
+    st.subheader("War Room — Tactical Shipping Map")
+    _dl = now - DEADLINE_UTC
+    if _dl.total_seconds() > 0:
+        _mins = int(_dl.total_seconds() // 60)
+        st.caption(
+            f"T+{_mins // 60:d}h {_mins % 60:02d}m post-deadline (GMT) — kinetic / AIS-blind posture along Suez–Red Sea axes; "
+            "Cape routing is the defensible commercial lane (+~20d vs Suez baseline)."
+        )
+    else:
+        st.caption(
+            "Suez corridor assessed blocked under high kinetic risk; Cape of Good Hope diversion is the active lane (+~20 days)."
+        )
+    streamlit_folium.st_folium(
+        build_tactical_war_room_map(),
+        use_container_width=True,
+        height=460,
+        returned_objects=[],
+        key="war_room_tactical_map",
+    )
 
     col_left, col_right = st.columns([1.05, 1.35], gap="large")
 

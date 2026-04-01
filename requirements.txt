@@ -4,3 +4,5 @@ yfinance
 feedparser
 requests
 streamlit-autorefresh
+folium==0.20.0
+streamlit-folium==0.27.1
