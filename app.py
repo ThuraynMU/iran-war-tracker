@@ -574,6 +574,14 @@ def _war_room_leaflet_contrast_css() -> str:
           line-height: 1.45 !important;
           color: #ffffff !important;
         }
+        @keyframes warroomTriesteBlink {
+          0%, 100% { transform: scale(1); opacity: 1; }
+          50% { transform: scale(1.42); opacity: 0.32; }
+        }
+        .warroom-trieste-blink-inner {
+          box-shadow: 0 0 20px rgba(255, 0, 0, 0.95);
+          animation: warroomTriesteBlink 0.85s ease-in-out infinite;
+        }
         </style>
         """
 
@@ -601,34 +609,73 @@ def _port_detail_popup_html(
     )
 
 
-def _add_trade_port_circle_marker(
-    m: folium.Map,
-    *,
-    lat: float,
-    lon: float,
-    port_name: str,
-    supply_shock_mag: float,
-    status: str,
-) -> None:
-    color_hex, d_mag = _trade_drop_bracket_color(supply_shock_mag)
+@dataclass(frozen=True)
+class WarRoomPortPin:
+    """Per-port bottleneck stats for the war room map (not rolled up to CN/EU totals)."""
+
+    port_name: str
+    lat: float
+    lon: float
+    supply_drop_mag: float
+    status: str
+    critical_blink: bool = False
+
+
+# Post–deadline scenario: port-level supply drop % (magnitude) and line status.
+WAR_ROOM_PORT_PINS: tuple[WarRoomPortPin, ...] = (
+    WarRoomPortPin("Port of Shanghai", 31.32, 121.75, 12.2, "Export Throttle"),
+    WarRoomPortPin("Shenzhen Bay Port", 22.5, 113.87, 18.5, "Tech Parts Congestion"),
+    WarRoomPortPin("Port of Rotterdam", 51.9244, 4.4777, 8.2, "Cape-Route Lag"),
+    WarRoomPortPin(
+        "Port of Trieste",
+        45.6495,
+        13.7768,
+        44.1,
+        "Suez Blockage Critical",
+        critical_blink=True,
+    ),
+)
+
+
+def _add_war_room_port_pin(m: folium.Map, pin: WarRoomPortPin) -> None:
+    d_mag = pin.supply_drop_mag
     inv = _inventory_days_remaining(d_mag)
     pct_disp = f"-{d_mag:.1f}%"
-    tip = (
-        f"{port_name}\nIncoming supply drop: {pct_disp}\nStatus: {status}"
+    tip = f"{pin.port_name}\nIncoming supply drop: {pct_disp}\nStatus: {pin.status}"
+    popup = folium.Popup(
+        _port_detail_popup_html(pin.port_name, pct_disp, pin.status, inv),
+        max_width=340,
     )
+    tt = folium.Tooltip(tip, sticky=True)
+
+    if pin.critical_blink:
+        html = (
+            '<div style="width:58px;height:58px;display:flex;align-items:center;'
+            'justify-content:center;">'
+            '<div class="warroom-trieste-blink-inner" style="'
+            "width:46px;height:46px;border-radius:50%;"
+            "background:rgba(255,0,0,0.55);border:4px solid #ff0000;"
+            '"></div></div>'
+        )
+        folium.Marker(
+            location=[pin.lat, pin.lon],
+            icon=folium.DivIcon(html=html, icon_size=(58, 58), icon_anchor=(29, 29)),
+            popup=popup,
+            tooltip=tt,
+        ).add_to(m)
+        return
+
+    color_hex, _ = _trade_drop_bracket_color(d_mag)
     folium.CircleMarker(
-        location=[lat, lon],
+        location=[pin.lat, pin.lon],
         radius=12,
         color=color_hex,
         weight=3,
         fill=True,
         fillColor=color_hex,
         fillOpacity=0.42,
-        popup=folium.Popup(
-            _port_detail_popup_html(port_name, pct_disp, status, inv),
-            max_width=340,
-        ),
-        tooltip=folium.Tooltip(tip, sticky=True),
+        popup=popup,
+        tooltip=tt,
     ).add_to(m)
 
 
@@ -686,39 +733,9 @@ def build_tactical_war_room_map(
             tooltip=folium.Tooltip(eu_rollover, sticky=True),
         ).add_to(m)
 
-    # Supply-chain hubs — CircleMarker (hover = summary; click = detail “panel” popup)
-    _add_trade_port_circle_marker(
-        m,
-        lat=31.32,
-        lon=121.75,
-        port_name="Port of Shanghai",
-        supply_shock_mag=cn_mag,
-        status="BACKLOG / QUEUE STRESS",
-    )
-    _add_trade_port_circle_marker(
-        m,
-        lat=22.5,
-        lon=113.87,
-        port_name="Shenzhen Bay Port",
-        supply_shock_mag=cn_mag,
-        status="PEARL DELTA CAPACITY PRESSURE",
-    )
-    _add_trade_port_circle_marker(
-        m,
-        lat=51.9244,
-        lon=4.4777,
-        port_name="Port of Rotterdam",
-        supply_shock_mag=eu_mag,
-        status="CONGESTED",
-    )
-    _add_trade_port_circle_marker(
-        m,
-        lat=45.6495,
-        lon=13.7768,
-        port_name="Port of Trieste",
-        supply_shock_mag=eu_mag,
-        status="SUEZ-DEPENDENT ALERT",
-    )
+    # Supply-chain hubs — port-specific shock/status (country GeoJson above keeps CN/EU rollovers)
+    for port_pin in WAR_ROOM_PORT_PINS:
+        _add_war_room_port_pin(m, port_pin)
 
     def _pulse_marker(lat: float, lon: float) -> None:
         html = """
