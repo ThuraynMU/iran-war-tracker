@@ -131,16 +131,16 @@ def _intel_highlight_row(row):
 
 
 def _trade_drop_split_pcts(raw_val) -> tuple[str, str]:
-    """Split IMF-style regional trade drop into retail (caution) vs maritime inbound (critical)."""
+    """Split regional trade shock into retail vs maritime deficit (%), both shown negative."""
     if raw_val is None:
         return "—", "—"
     if isinstance(raw_val, str) and raw_val.strip() in ("", "—", "N/A"):
         return "—", "—"
     try:
-        incoming = float(raw_val)
-        retail = round(max(0.6, min(4.5, incoming * 0.072 + 0.9)), 1)
-        inc_disp = round(incoming, 1)
-        return f"{retail}%", f"{inc_disp}%"
+        mag = abs(float(raw_val))
+        retail_mag = round(max(0.6, min(4.5, mag * 0.072 + 0.9)), 1)
+        inc_mag = round(mag, 1)
+        return f"-{retail_mag}%", f"-{inc_mag}%"
     except (TypeError, ValueError):
         return "—", "—"
 
@@ -678,34 +678,35 @@ def main() -> None:
     m2.metric("Wait-List (Fujairah)", hs_main.wait_list_tankers_fujairah_proxy if hs_main.wait_list_tankers_fujairah_proxy is not None else "—")
 
     _eu_final_tooltip = (
-        "Reflects 30-day inventory buffers and front-loaded winter stock. "
-        "Consumers have not felt the impact yet."
+        "Negative % = trade / demand deficit vs baseline. Reflects 30-day inventory buffers and "
+        "front-loaded winter stock; consumers have not felt the full impact yet."
     )
     _eu_supply_tooltip = (
-        "Reflects the collapse in Suez transits and 20-day delays for Cape of Good Hope diversions. "
-        "Primary impact: Trieste, Piraeus, and Mediterranean industrial hubs."
+        "Negative % = inbound supply deficit vs baseline. Reflects Suez transit collapse and "
+        "~20-day Cape of Good Hope diversions. Primary impact: Trieste, Piraeus, and Mediterranean hubs."
     )
     cn_r, cn_i = _trade_drop_split_pcts(hs_main.trade_value_drop_pct.get("China"))
     us_r, us_i = _trade_drop_split_pcts(hs_main.trade_value_drop_pct.get("US"))
     _cn_final_tooltip = (
-        "Reflects inventory buffers and front-loaded stock in China retail channels; "
+        "Negative % = trade deficit vs baseline. Retail-channel buffers and front-loaded stock; "
         "consumer impact typically lags maritime disruption."
     )
     _cn_supply_tooltip = (
-        "Reflects inbound maritime stress: port delays, Asia–Europe routing, and diversion-driven "
+        "Negative % = inbound supply deficit. Port delays, Asia–Europe routing stress, and diversion-driven "
         "lag for Chinese industrial and retail supply chains."
     )
     _us_final_tooltip = (
-        "Reflects U.S. retail and wholesale buffers; on-shelf effects often lag ocean-freight shocks."
+        "Negative % = trade deficit vs baseline. U.S. retail and wholesale buffers; "
+        "on-shelf effects often lag ocean-freight shocks."
     )
     _us_supply_tooltip = (
-        "Reflects U.S. inbound maritime disruption: container backlogs, diversions, and gateway congestion "
-        "at major import hubs."
+        "Negative % = inbound supply deficit. Container backlogs, diversions, and gateway congestion "
+        "at major U.S. import hubs."
     )
 
     with col_eu:
         st.markdown(
-            _region_trade_column_markdown("EU", "1.8%", "24.5%", _eu_final_tooltip, _eu_supply_tooltip),
+            _region_trade_column_markdown("EU", "-1.8%", "-24.5%", _eu_final_tooltip, _eu_supply_tooltip),
             unsafe_allow_html=True,
         )
     with col_cn:

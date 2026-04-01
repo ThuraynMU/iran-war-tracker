@@ -596,26 +596,12 @@ def fetch_official_tehran_narrative(
     if pv:
         for it in pv:
             it["Source"] = "Press TV (Iran RSS)"
-        if (api_key or "").strip():
-            cap = (
-                "NewsData.io returned no articles for this run; showing Press TV Iran RSS "
-                "(English, state-affiliated). Check NewsData quota or parameters."
-            )
-        else:
-            cap = (
-                "No NEWSDATA_API_KEY — using Press TV Iran RSS (English). "
-                "Add a NewsData key in Streamlit **Secrets** to merge the API feed."
-            )
-        if hint_nd and ("HTTP" in hint_nd or "failed" in hint_nd.lower()):
-            cap = f"{cap} ({hint_nd})"
-        return pv, cap
+        # No nag caption when RSS fills the panel; NewsData remains preferred when it returns rows.
+        return pv, None
 
     tail = hint_nd
     if not tail:
-        tail = (
-            "No articles from NewsData.io or Press TV RSS. "
-            "Add NEWSDATA_API_KEY for NewsData, or check network access to presstv.ir."
-        )
+        tail = "No articles from NewsData.io or Press TV RSS (check network or feeds)."
     return [], tail
 
 
