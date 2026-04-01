@@ -517,6 +517,30 @@ def main() -> None:
             word-break: break-word !important;
             vertical-align: top !important;
           }
+          .eu-metric-slot .eu-metric-label {
+            font-size: 0.82rem;
+            color: #c8c8c8 !important;
+            letter-spacing: 0.02em;
+            margin-bottom: 2px;
+          }
+          .eu-metric-slot .eu-final-sales-value {
+            color: #ffff00 !important;
+            font-weight: 900;
+            font-size: 1.65rem;
+            line-height: 1.15;
+          }
+          @keyframes euSupplyChainBlink {
+            0%, 100% { color: #ff6464; text-shadow: 0 0 0 transparent; }
+            50% { color: #ff0000; text-shadow: 0 0 16px rgba(255, 0, 0, 0.9); }
+          }
+          .eu-metric-slot .eu-supply-chain-value {
+            animation: euSupplyChainBlink 1.05s ease-in-out infinite;
+            font-weight: 900;
+            font-size: 1.65rem;
+            line-height: 1.15;
+          }
+          .eu-metric-slot .eu-metric-block { margin-bottom: 14px; }
+          .eu-metric-slot .eu-metric-block:last-child { margin-bottom: 0; }
           .block-container { padding-top: 1.2rem; }
         </style>
         """,
@@ -600,10 +624,33 @@ def main() -> None:
 
     # Big-number metrics (same cache as sidebar — one PortWatch/IMF fetch per TTL, not two)
     hs_main = _cached_hormuz_stats()
-    m1, m2, m3, m4, m5 = st.columns(5, gap="small")
+    m1, m2, eu_metrics, m4, m5 = st.columns([1, 1, 1.55, 1, 1], gap="small")
     m1.metric("Hormuz Daily Transits", hs_main.daily_transits_total if hs_main.daily_transits_total is not None else "—")
     m2.metric("Wait-List (Fujairah)", hs_main.wait_list_tankers_fujairah_proxy if hs_main.wait_list_tankers_fujairah_proxy is not None else "—")
-    m3.metric("Trade Drop EU (%)", hs_main.trade_value_drop_pct.get("EU", "—"))
+    _eu_final_tooltip = (
+        "Reflects 30-day inventory buffers and front-loaded winter stock. "
+        "Consumers have not felt the impact yet."
+    )
+    _eu_supply_tooltip = (
+        "Reflects the collapse in Suez transits and 20-day delays for Cape of Good Hope diversions. "
+        "Primary impact: Trieste, Piraeus, and Mediterranean industrial hubs."
+    )
+    with eu_metrics:
+        st.markdown(
+            f"""
+            <div class="eu-metric-slot">
+              <div class="eu-metric-block" title="{html.escape(_eu_final_tooltip)}">
+                <div class="eu-metric-label">Final Sales (Retail Index)</div>
+                <div class="eu-final-sales-value">1.8%</div>
+              </div>
+              <div class="eu-metric-block" title="{html.escape(_eu_supply_tooltip)}">
+                <div class="eu-metric-label">Incoming Supply Chain (Maritime Inbound)</div>
+                <div class="eu-supply-chain-value">24.5%</div>
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
     m4.metric("Trade Drop China (%)", hs_main.trade_value_drop_pct.get("China", "—"))
     m5.metric("Trade Drop US (%)", hs_main.trade_value_drop_pct.get("US", "—"))
     if hs_main.blockade_detected:
