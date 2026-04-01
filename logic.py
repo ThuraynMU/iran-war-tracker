@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from calendar import timegm
 from dataclasses import dataclass
 from datetime import UTC, datetime
-import time
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import feedparser
@@ -49,6 +50,9 @@ GOOGLE_NEWS_HORMUZ_RSS_URL = (
 
 GOOGLE_NEWS_RSS_BASE = "https://news.google.com/rss/search"
 
+# Faster-moving than Google’s index for the same stories; merged after Google queries.
+BBC_MIDDLE_EAST_RSS_URL = "https://feeds.bbci.co.uk/news/world/middle_east/rss.xml"
+
 # Browser-like defaults reduce blocks from Google RSS on cloud IPs.
 DEFAULT_RSS_REQUEST_HEADERS: dict[str, str] = {
     "User-Agent": (
@@ -85,6 +89,72 @@ def _normalized_entry(*, dt: str, source: str, title: str, link: str) -> dict[st
     }
 
 
+def _parse_header_date_ts(label: str) -> float:
+    """RFC 2822 / RSS pubDate → sortable unix timestamp (UTC)."""
+    s = (label or "").strip()
+    if not s:
+        return float("-inf")
+    try:
+        dt = parsedate_to_datetime(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt.timestamp()
+    except (TypeError, ValueError, OverflowError):
+        return float("-inf")
+
+
+def _published_ts_from_feed_entry(e: Any) -> float:
+    t = getattr(e, "published_parsed", None) or getattr(e, "updated_parsed", None)
+    if t and getattr(t, "tm_year", 0) > 1990:
+        try:
+            return float(timegm(t))
+        except (TypeError, ValueError, OverflowError):
+            pass
+    lbl = (getattr(e, "published", "") or getattr(e, "updated", "") or "").strip()
+    return _parse_header_date_ts(lbl)
+
+
+def _row_matches_intel_focus(row: dict[str, str]) -> bool:
+    blob = f"{row.get('Title', '')} {row.get('Source', '')}".lower()
+    keys = (
+        "iran",
+        "irgc",
+        "hormuz",
+        "strait",
+        "tehran",
+        "israel",
+        "missile",
+        "drone",
+        "strike",
+        "military",
+        "shipping",
+        "tanker",
+        "kuwait",
+        "uae",
+        "dubai",
+        "pentagon",
+        "u.s.",
+        " us ",
+        "navy",
+        "deadline",
+        "tech",
+        "red sea",
+        "oil",
+        "houthis",
+        "yemen",
+        "gulf",
+    )
+    return any(k in blob for k in keys)
+
+
+def _entry_title(it: dict[str, str]) -> str:
+    return str(it.get("Title") or it.get("title") or "")
+
+
+def _entry_source(it: dict[str, str]) -> str:
+    return str(it.get("Source") or it.get("source") or "")
+
+
 def fetch_live_rss_entries(
     feed_url: str = GOOGLE_NEWS_HORMUZ_RSS_URL,
     *,
@@ -97,15 +167,25 @@ def fetch_live_rss_entries(
       { "Date/Time (UTC)": "...", "Source": "...", "Title": "...", "Link": "..." }
 
     For Google News RSS, `title` often looks like: "Headline text - Publisher".
+
+    Fetches a larger pool from the wire, sorts by real publish time (struct_time),
+    then returns the newest `limit` rows — Google often returns a mixed order, and
+    taking entries[:limit] without sorting hid fresher items past position N.
     """
-    headers = {**DEFAULT_RSS_REQUEST_HEADERS, **(request_headers or {})}
+    headers = {
+        **DEFAULT_RSS_REQUEST_HEADERS,
+        **(request_headers or {}),
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
     r = requests.get(feed_url, headers=headers, timeout=timeout_s)
     r.raise_for_status()
 
     parsed = feedparser.parse(r.content)
     entries = getattr(parsed, "entries", []) or []
-    out: list[dict[str, str]] = []
-    for e in entries[: max(0, limit)]:
+    pool = entries[:150]
+    scored: list[tuple[float, dict[str, str]]] = []
+    for e in pool:
         raw_title = (getattr(e, "title", "") or "").strip()
         link = (getattr(e, "link", "") or "").strip()
 
@@ -125,10 +205,10 @@ def fetch_live_rss_entries(
             if publisher:
                 source = publisher
         if title or source or link or dt_label:
-            out.append(_normalized_entry(dt=dt_label, source=source, title=title, link=link))
-    # Ensure chronological sorting (most recent first) when timestamps exist.
-    out.sort(key=lambda x: x.get("Date/Time (UTC)", ""), reverse=True)
-    return out
+            ts = _published_ts_from_feed_entry(e)
+            scored.append((ts, _normalized_entry(dt=dt_label, source=source, title=title, link=link)))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [row for _, row in scored[: max(0, limit)]]
 
 
 def fetch_live_google_news_multiquery(
@@ -138,16 +218,23 @@ def fetch_live_google_news_multiquery(
     timeout_s: float = 12.0,
     min_results: int = 5,
     request_headers: dict[str, str] | None = None,
+    include_bbc_middle_east: bool = True,
 ) -> list[dict[str, str]]:
     """
     Fetch multiple Google News RSS queries and merge results.
     If fewer than `min_results` total results, inject Ground Truth (Apr 1, 2026).
+
+    Appends ` when:1d` (Google News operator) when the query has no `when:` yet,
+    skewing RSS toward recent items (Google’s feed order alone is unreliable).
     """
     merged: list[dict[str, str]] = []
     seen: set[tuple[str, str, str]] = set()
 
     for q in queries:
-        url = _google_news_rss_url(q)
+        q2 = q.strip()
+        if " when:" not in q2.lower():
+            q2 = f"{q2} when:1d"
+        url = _google_news_rss_url(q2)
         items = fetch_live_rss_entries(
             url, limit=per_query_limit, timeout_s=timeout_s, request_headers=request_headers
         )
@@ -157,6 +244,25 @@ def fetch_live_google_news_multiquery(
                 continue
             seen.add(key)
             merged.append(it)
+
+    if include_bbc_middle_east:
+        try:
+            bbc_items = fetch_live_rss_entries(
+                BBC_MIDDLE_EAST_RSS_URL,
+                limit=max(per_query_limit, 30),
+                timeout_s=timeout_s,
+                request_headers=request_headers,
+            )
+            for it in bbc_items:
+                if not _row_matches_intel_focus(it):
+                    continue
+                key = (it.get("Source", ""), it.get("Title", ""), it.get("Link", ""))
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(it)
+        except Exception:
+            pass
 
     if len(merged) < min_results:
         now_label = datetime.now(UTC).strftime("%a, %d %b %Y %H:%M:%S GMT")
@@ -170,7 +276,7 @@ def fetch_live_google_news_multiquery(
                 )
             )
 
-    merged.sort(key=lambda x: x.get("Date/Time (UTC)", ""), reverse=True)
+    merged.sort(key=lambda x: _parse_header_date_ts(x.get("Date/Time (UTC)", "")), reverse=True)
     return merged
 
 
@@ -274,8 +380,8 @@ def evaluate_strait_status_from_live_entries(entries: list[dict[str, str]]) -> S
     # Check for official all-clear first (it can override general threat chatter).
     confirmations: list[str] = []
     for it in recent:
-        title = norm(it.get("title", ""))
-        source = norm(it.get("source", ""))
+        title = norm(_entry_title(it))
+        source = norm(_entry_source(it))
         if any(k in title for k in all_clear_keywords) and any(a in source or a in title for a in authority_sources):
             if "imo" in source or "international maritime organization" in source or "imo" in title:
                 confirmations.append("IMO")
@@ -291,7 +397,7 @@ def evaluate_strait_status_from_live_entries(entries: list[dict[str, str]]) -> S
 
     # Threat scan.
     for it in recent:
-        title = norm(it.get("title", ""))
+        title = norm(_entry_title(it))
         if any(k in title for k in threat_keywords):
             return StraitStatus(
                 evaluated_at_utc=now,

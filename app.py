@@ -543,16 +543,18 @@ def main() -> None:
                 st.cache_data.clear()
                 st.rerun()
 
-        @st.cache_data(ttl=600, show_spinner=False)
+        @st.cache_data(ttl=90, show_spinner=False)
         def _cached_live_entries() -> list[dict]:
+            # logic.py adds Google `when:1d` for recency except lines that already include `when:`.
             queries = [
-                "(Iran OR IRGC) AND (deadline OR target OR tech)",
-                "(Hormuz OR 'Red Sea') AND (shipping OR tanker OR strike)",
-                "(Israel OR 'United States') AND Iran AND war AND live",
+                "(Iran OR IRGC) AND (deadline OR target OR tech OR strike OR missile OR drone)",
+                "(Hormuz OR 'Red Sea' OR Strait) AND (shipping OR tanker OR Iran OR IRGC OR strike)",
+                "(Israel OR 'United States' OR Pentagon) AND (Iran OR IRGC OR war OR military OR Gulf)",
+                "Iran OR IRGC OR Hormuz OR 'Strait of Hormuz' when:6h",
             ]
             return fetch_live_google_news_multiquery(
                 queries,
-                per_query_limit=15,
+                per_query_limit=45,
                 min_results=5,
                 request_headers=NEWS_RSS_REQUEST_HEADERS,
             )
