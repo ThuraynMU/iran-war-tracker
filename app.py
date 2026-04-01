@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import html
 import os
+import re
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 import folium
@@ -97,6 +99,162 @@ def _cached_tehran_narrative():
         api_key=_newsdata_api_key(),
         request_headers=NEWS_RSS_REQUEST_HEADERS,
     )
+
+
+@st.cache_data(ttl=90, show_spinner=False)
+def _cached_live_entries() -> list[dict]:
+    # logic.py adds Google `when:1d` for recency except lines that already include `when:`.
+    queries = [
+        "(Iran OR IRGC) AND (deadline OR target OR tech OR strike OR missile OR drone)",
+        "(Hormuz OR 'Red Sea' OR Strait) AND (shipping OR tanker OR Iran OR IRGC OR strike)",
+        "(Israel OR 'United States' OR Pentagon) AND (Iran OR IRGC OR war OR military OR Gulf)",
+        "Iran OR IRGC OR Hormuz OR 'Strait of Hormuz' when:6h",
+    ]
+    return fetch_live_google_news_multiquery(
+        queries,
+        per_query_limit=45,
+        min_results=5,
+        request_headers=NEWS_RSS_REQUEST_HEADERS,
+    )
+
+
+# BlackRock-style geopolitical risk proxy: keyword "vocal volume" vs a calm baseline.
+BGRI_FLASHPOINT_KEYWORDS: tuple[str, ...] = (
+    "Hormuz",
+    "Strait",
+    "Kinetic",
+    "Drone",
+    "Blockade",
+    "Insurance",
+    "Ultimatum",
+)
+BGRI_BASELINE_HITS = 5.0  # simulated 30-day average hit counts
+
+
+@dataclass(frozen=True)
+class BgriResult:
+    score: int  # 0–100, 100 = peak panic
+    pct_vs_baseline: float
+    today_hits: int
+    headline_sample_size: int
+
+
+def _gather_bgri_headlines(
+    entries: list[dict],
+    tehran_rows: list[dict],
+    tactical_rows: list[dict],
+    *,
+    max_headlines: int = 100,
+) -> list[str]:
+    """De-duplicate titles, cap at max_headlines (Google RSS + Tehran + kinetic OSINT)."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for bucket in (entries, tehran_rows, tactical_rows):
+        for row in bucket or []:
+            t = str(row.get("Title") or "").strip()
+            if not t:
+                continue
+            key = t.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(t)
+            if len(out) >= max_headlines:
+                return out
+    return out
+
+
+def _count_flashpoint_hits(headlines: list[str], keywords: tuple[str, ...]) -> int:
+    total = 0
+    for line in headlines:
+        low = line.casefold()
+        for kw in keywords:
+            pat = r"(?<![A-Za-z0-9])" + re.escape(kw.casefold()) + r"(?![A-Za-z0-9])"
+            total += len(re.findall(pat, low))
+    return total
+
+
+def compute_bgri(
+    entries: list[dict],
+    tehran_rows: list[dict],
+    tactical_rows: list[dict],
+    *,
+    baseline: float = BGRI_BASELINE_HITS,
+) -> BgriResult:
+    headlines = _gather_bgri_headlines(entries, tehran_rows, tactical_rows)
+    today_hits = _count_flashpoint_hits(headlines, BGRI_FLASHPOINT_KEYWORDS)
+    if baseline <= 0:
+        baseline = BGRI_BASELINE_HITS
+    pct_vs_baseline = ((today_hits - baseline) / baseline) * 100.0
+    # Map ratio to 0–100 (baseline-only day → ~20; 4× baseline → 80; ≥5× → 100)
+    score = int(min(100, max(0, round((today_hits / baseline) * 20.0))))
+    return BgriResult(
+        score=score,
+        pct_vs_baseline=pct_vs_baseline,
+        today_hits=today_hits,
+        headline_sample_size=len(headlines),
+    )
+
+
+def render_bgri_attention_gauge(bgri: BgriResult) -> None:
+    """Top-of-dash gauge: digesting (green) vs spiraling (red)."""
+    if bgri.score > 70:
+        val_color = "#ff3b3b"
+        bar_color = "linear-gradient(90deg, #ffdd00 0%, #ff3b3b 100%)"
+        fw = "900"
+    elif bgri.score < 30:
+        val_color = "#2ee85a"
+        bar_color = "linear-gradient(90deg, #1a6b32 0%, #2ee85a 100%)"
+        fw = "700"
+    else:
+        val_color = "#fffacd"
+        bar_color = "linear-gradient(90deg, #c9a000 0%, #fffacd 100%)"
+        fw = "800"
+
+    pct = max(0, min(100, bgri.score))
+    arc_angle = 180.0 * (pct / 100.0)
+    # SVG semicircle gauge (0–180° sweep)
+    svg = f"""
+    <svg width="280" height="150" viewBox="0 0 280 150" xmlns="http://www.w3.org/2000/svg" aria-label="BGRI gauge">
+      <path d="M 40 130 A 100 100 0 0 1 240 130" fill="none" stroke="#333333" stroke-width="14" stroke-linecap="round"/>
+      <path d="M 40 130 A 100 100 0 0 1 240 130" fill="none" stroke="{val_color}" stroke-width="14"
+            stroke-linecap="round" stroke-dasharray="{314.16 * (arc_angle / 180.0):.1f} 314.16"/>
+      <text x="140" y="118" text-anchor="middle" fill="{val_color}" font-size="36" font-weight="{fw}" font-family="system-ui,sans-serif">{bgri.score}</text>
+      <text x="140" y="142" text-anchor="middle" fill="#aaaaaa" font-size="11" letter-spacing="0.12em">0 DIGEST</text>
+      <text x="250" y="142" text-anchor="end" fill="#aaaaaa" font-size="11" letter-spacing="0.12em">PANIC 100</text>
+    </svg>
+    """
+
+    with st.container(border=True):
+        st.markdown("### MARKET ATTENTION SCORE (BGRI)")
+        st.caption(
+            f"Flashpoint keyword hits in last {bgri.headline_sample_size} de‑duplicated headlines "
+            f"(Google RSS + Tehran + kinetic OSINT) vs {BGRI_BASELINE_HITS:g}-hit 30‑day baseline proxy."
+        )
+        g1, g2 = st.columns([1.15, 1.0], gap="large")
+        with g1:
+            st.markdown(svg, unsafe_allow_html=True)
+            st.markdown(
+                f'<div style="height:10px;border-radius:6px;background:#1a1a1a;overflow:hidden;">'
+                f'<div style="width:{pct}%;height:100%;background:{bar_color};"></div></div>',
+                unsafe_allow_html=True,
+            )
+        with g2:
+            st.markdown(
+                '<p style="font-size:0.95rem;color:#c8c8c8;margin:0 0 6px 0;">Attention index (0–100)</p>',
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f'<p style="margin:0;font-size:2.75rem;font-weight:{fw};color:{val_color};line-height:1.05;">'
+                f"{bgri.score}</p>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f'<p style="margin:10px 0 6px 0;font-size:1.2rem;font-weight:800;color:#ffaa66;">'
+                f"Δ {bgri.pct_vs_baseline:+.0f}% vs baseline • "
+                f'hits <b style="color:#fff">{bgri.today_hits}</b> / norm <b style="color:#fff">{BGRI_BASELINE_HITS:g}</b></p>',
+                unsafe_allow_html=True,
+            )
 
 
 def _prepare_intel_dataframe(
@@ -709,6 +867,7 @@ def main() -> None:
 
     tactical_osint_rows, hormuz_kinetic_flash = _cached_liveuamap_bundle()
     tehran_official_rows, tehran_feed_caption = _cached_tehran_narrative()
+    bgri_live_entries = _cached_live_entries()
 
     st.markdown(
         '<div style="height:1.35rem" aria-hidden="true"></div>',
@@ -924,6 +1083,9 @@ def main() -> None:
 
     render_tactical_alert_banner(now)
 
+    _bgri = compute_bgri(bgri_live_entries, tehran_official_rows, tactical_osint_rows)
+    render_bgri_attention_gauge(_bgri)
+
     # Big-number metrics (same cache as sidebar — one PortWatch/IMF fetch per TTL, not two)
     hs_main = _cached_hormuz_stats()
     m1, m2, col_eu, col_cn, col_us = st.columns([1, 1, 1.35, 1.35, 1.35], gap="small")
@@ -1024,23 +1186,7 @@ def main() -> None:
     with col_right:
         st.subheader("Live Intel Feed")
 
-        @st.cache_data(ttl=90, show_spinner=False)
-        def _cached_live_entries() -> list[dict]:
-            # logic.py adds Google `when:1d` for recency except lines that already include `when:`.
-            queries = [
-                "(Iran OR IRGC) AND (deadline OR target OR tech OR strike OR missile OR drone)",
-                "(Hormuz OR 'Red Sea' OR Strait) AND (shipping OR tanker OR Iran OR IRGC OR strike)",
-                "(Israel OR 'United States' OR Pentagon) AND (Iran OR IRGC OR war OR military OR Gulf)",
-                "Iran OR IRGC OR Hormuz OR 'Strait of Hormuz' when:6h",
-            ]
-            return fetch_live_google_news_multiquery(
-                queries,
-                per_query_limit=45,
-                min_results=5,
-                request_headers=NEWS_RSS_REQUEST_HEADERS,
-            )
-
-        entries = _cached_live_entries()
+        entries = bgri_live_entries
         discerner = evaluate_strait_status_from_live_entries(entries)
         discerner = apply_kinetic_hormuz_maximum_override(discerner, hormuz_kinetic=hormuz_kinetic_flash)
 
