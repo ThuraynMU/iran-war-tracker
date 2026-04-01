@@ -582,6 +582,13 @@ def _war_room_leaflet_contrast_css() -> str:
           box-shadow: 0 0 20px rgba(255, 0, 0, 0.95);
           animation: warroomTriesteBlink 0.85s ease-in-out infinite;
         }
+        @keyframes warroomPulse {
+          0%, 100% { transform: scale(1); opacity: 0.95; }
+          50% { transform: scale(1.38); opacity: 0.42; }
+        }
+        .warroom-hormuz-pulse-inner {
+          animation: warroomPulse 1.15s ease-in-out infinite;
+        }
         </style>
         """
 
@@ -609,6 +616,23 @@ def _port_detail_popup_html(
     )
 
 
+def _hormuz_strait_popup_html() -> str:
+    """Hormuz conflict node — detail panel (mirrors port popup styling)."""
+    status = "CONSTRUCTIVE TOTAL LOSS ZONE"
+    return (
+        f'<div style="font-family:system-ui,ui-monospace,Menlo,monospace;">'
+        f'<h3 style="color:#ffff00;margin:0 0 10px 0;font-size:17px;letter-spacing:0.03em;">'
+        f"Strait of Hormuz</h3>"
+        f'<p style="margin:5px 0;"><span style="color:#c8c8c8;">Status:</span> '
+        f'<b style="color:#ff9800;">{html.escape(status)}</b></p>'
+        f'<p style="margin:12px 0 0 0;font-size:12px;color:#aaaaaa;">'
+        f"Conflict branch from Malacca. Elevated hull, cargo, and crew risk; "
+        f"correlate with Live Intel / Discerner readouts.</p>"
+        f'<p style="margin:8px 0 0 0;font-size:11px;color:#777;">Hover: STATUS line on map tooltip.</p>'
+        f"</div>"
+    )
+
+
 @dataclass(frozen=True)
 class WarRoomPortPin:
     """Per-port bottleneck stats for the war room map (not rolled up to CN/EU totals)."""
@@ -622,19 +646,42 @@ class WarRoomPortPin:
 
 
 # Post–deadline scenario: port-level supply drop % (magnitude) and line status.
+# Coordinates align with closed-loop polylines below (Shanghai / Shenzhen / EU hubs).
 WAR_ROOM_PORT_PINS: tuple[WarRoomPortPin, ...] = (
-    WarRoomPortPin("Port of Shanghai", 31.32, 121.75, 12.2, "Export Throttle"),
-    WarRoomPortPin("Shenzhen Bay Port", 22.5, 113.87, 18.5, "Tech Parts Congestion"),
-    WarRoomPortPin("Port of Rotterdam", 51.9244, 4.4777, 8.2, "Cape-Route Lag"),
+    WarRoomPortPin("Port of Shanghai", 31.2, 121.5, 12.2, "Export Throttle"),
+    WarRoomPortPin("Shenzhen Bay Port", 22.5, 113.9, 18.5, "Tech Parts Congestion"),
+    WarRoomPortPin("Port of Rotterdam", 51.9, 3.9, 8.2, "Cape-Route Lag"),
     WarRoomPortPin(
         "Port of Trieste",
-        45.6495,
-        13.7768,
+        45.6,
+        13.7,
         44.1,
         "Suez Blockage Critical",
         critical_blink=True,
     ),
 )
+
+# Single continuous polylines — lat, lon — shared nodes tie the network together.
+WAR_ROOM_SUEZ_BLOCKED_ROUTE_LL: list[list[float]] = [
+    [31.2, 121.5],
+    [22.5, 113.9],
+    [1.3, 103.8],
+    [12.6, 43.3],
+    [29.9, 32.5],
+    [45.6, 13.7],
+]
+WAR_ROOM_CAPE_ACTIVE_ROUTE_LL: list[list[float]] = [
+    [31.2, 121.5],
+    [22.5, 113.9],
+    [1.3, 103.8],
+    [-34.4, 18.5],
+    [51.9, 3.9],
+]
+WAR_ROOM_CONFLICT_BRANCH_LL: list[list[float]] = [
+    [1.3, 103.8],
+    [26.6, 56.5],
+]
+WAR_ROOM_HORMUZ_LAT_LON: tuple[float, float] = (26.6, 56.5)
 
 
 def _add_war_room_port_pin(m: folium.Map, pin: WarRoomPortPin) -> None:
@@ -679,12 +726,31 @@ def _add_war_room_port_pin(m: folium.Map, pin: WarRoomPortPin) -> None:
     ).add_to(m)
 
 
+def _add_hormuz_conflict_marker(m: folium.Map) -> None:
+    lat, lon = WAR_ROOM_HORMUZ_LAT_LON
+    tip = "Strait of Hormuz\nSTATUS: CONSTRUCTIVE TOTAL LOSS ZONE"
+    html = (
+        '<div style="width:52px;height:52px;display:flex;align-items:center;'
+        'justify-content:center;">'
+        '<div class="warroom-hormuz-pulse-inner" style="'
+        "width:40px;height:40px;border-radius:50%;"
+        "background:rgba(255,140,0,0.45);border:3px solid #ff9800;"
+        'box-shadow:0 0 18px rgba(255,152,0,0.95);"></div></div>'
+    )
+    folium.Marker(
+        location=[lat, lon],
+        icon=folium.DivIcon(html=html, icon_size=(52, 52), icon_anchor=(26, 26)),
+        tooltip=folium.Tooltip(tip, sticky=True),
+        popup=folium.Popup(_hormuz_strait_popup_html(), max_width=340),
+    ).add_to(m)
+
+
 def build_tactical_war_room_map(
     trade_drop_pct: dict[str, float] | None = None,
 ) -> folium.Map:
     """
-    High-contrast tactical shipping overlay: blocked Suez corridor vs active Cape route;
-    escalation zones at Hormuz and Bab el-Mandeb; hub markers colored by incoming supply-chain shock.
+    Tactical overlay: closed-loop great-circle narrative routes (blocked Suez vs active Cape),
+    Malacca–Hormuz conflict branch, and port pins anchored to route endpoints (WAR_ROOM_PORT_PINS).
     """
     m = folium.Map(
         location=[15.0, 45.0],
@@ -733,79 +799,46 @@ def build_tactical_war_room_map(
             tooltip=folium.Tooltip(eu_rollover, sticky=True),
         ).add_to(m)
 
-    # Supply-chain hubs — port-specific shock/status (country GeoJson above keeps CN/EU rollovers)
-    for port_pin in WAR_ROOM_PORT_PINS:
-        _add_war_room_port_pin(m, port_pin)
-
-    def _pulse_marker(lat: float, lon: float) -> None:
-        html = """
-<div style="width:52px;height:52px;display:flex;align-items:center;justify-content:center;">
-  <div style="
-    width:40px;height:40px;border-radius:50%;
-    background:rgba(255,30,30,0.45);border:3px solid #ff2222;
-    box-shadow:0 0 18px rgba(255,40,40,0.95);
-    animation:warroomPulse 1.15s ease-in-out infinite;
-  "></div>
-</div>
-<style>
-@keyframes warroomPulse {
-  0%, 100% { transform: scale(1); opacity: 0.95; }
-  50% { transform: scale(1.38); opacity: 0.42; }
-}
-</style>
-"""
-        folium.Marker(
-            location=[lat, lon],
-            icon=folium.DivIcon(html=html, icon_size=(52, 52), icon_anchor=(26, 26)),
-            tooltip="ZONE OF ESCALATION",
-        ).add_to(m)
-
-    # Strait of Hormuz / Bab el-Mandeb — kinetic cue
-    _pulse_marker(26.72, 56.08)
-    _pulse_marker(12.59, 43.34)
-
-    suez_route: list[list[float]] = [
-        [1.29, 103.85],
-        [5.5, 100.0],
-        [6.0, 80.0],
-        [10.5, 62.0],
-        [12.59, 43.34],
-        [20.0, 38.5],
-        [29.9, 32.55],
-        [35.5, 23.0],
-        [41.5, 12.0],
-        [47.0, 6.0],
-        [51.92, 4.48],
-    ]
+    # Closed-loop network: underline first so port / Hormuz markers stack on top.
     folium.PolyLine(
-        locations=suez_route,
+        locations=WAR_ROOM_SUEZ_BLOCKED_ROUTE_LL,
         color="#ff1a1a",
         weight=5,
         opacity=0.92,
-        tooltip="SUEZ CANAL: BLOCKED (HIGH KINETIC RISK)",
+        tooltip=folium.Tooltip(
+            "BLOCKED SUEZ ROUTE — Shanghai → Shenzhen → Malacca → Bab el-Mandeb → "
+            "Suez → Port of Trieste",
+            sticky=True,
+        ),
     ).add_to(m)
-
-    cape_route: list[list[float]] = [
-        [1.29, 103.85],
-        [-4.0, 92.0],
-        [-18.0, 78.0],
-        [-32.0, 58.0],
-        [-40.0, 32.0],
-        [-34.36, 18.5],
-        [-28.0, 8.0],
-        [-15.0, -4.0],
-        [2.0, -18.0],
-        [42.0, -12.0],
-        [51.0, -4.0],
-        [51.92, 4.48],
-    ]
     folium.PolyLine(
-        locations=cape_route,
-        color="#00e8ff",
+        locations=WAR_ROOM_CAPE_ACTIVE_ROUTE_LL,
+        color="#2196f3",
         weight=5,
         opacity=0.9,
-        tooltip="ACTIVE ROUTE: +20 DAYS DELAY",
+        tooltip=folium.Tooltip(
+            "ACTIVE CAPE ROUTE — Shanghai → Shenzhen → Malacca → Cape of Good Hope → "
+            "Port of Rotterdam",
+            sticky=True,
+        ),
     ).add_to(m)
+    folium.PolyLine(
+        locations=WAR_ROOM_CONFLICT_BRANCH_LL,
+        color="#ff9800",
+        weight=5,
+        opacity=0.88,
+        tooltip=folium.Tooltip(
+            "CONFLICT BRANCH — Malacca → Strait of Hormuz",
+            sticky=True,
+        ),
+    ).add_to(m)
+
+    # Supply-chain hubs — each pin uses WAR_ROOM_PORT_PINS (tooltip + popup); Trieste / Rotterdam
+    # sit on the terminal vertices of the red / blue lines respectively.
+    for port_pin in WAR_ROOM_PORT_PINS:
+        _add_war_room_port_pin(m, port_pin)
+
+    _add_hormuz_conflict_marker(m)
 
     return m
 
@@ -1531,13 +1564,41 @@ def main() -> None:
         st.caption(
             "Suez corridor assessed blocked under high kinetic risk; Cape of Good Hope diversion is the active lane (+~20 days)."
         )
-    streamlit_folium.st_folium(
-        build_tactical_war_room_map(hs_main.trade_value_drop_pct),
-        use_container_width=True,
-        height=460,
-        returned_objects=[],
-        key="war_room_tactical_map",
-    )
+    st.session_state.setdefault("war_room_side_panel_html", None)
+    _wm_col, _panel_col = st.columns([1.65, 1.0], gap="medium")
+    with _wm_col:
+        _war_map_out = streamlit_folium.st_folium(
+            build_tactical_war_room_map(hs_main.trade_value_drop_pct),
+            use_container_width=True,
+            height=460,
+            returned_objects=[
+                "last_object_clicked",
+                "last_object_clicked_popup",
+                "last_object_clicked_tooltip",
+            ],
+            key="war_room_tactical_map",
+        )
+    _wmo = _war_map_out or {}
+    _pop = _wmo.get("last_object_clicked_popup")
+    _tip = _wmo.get("last_object_clicked_tooltip")
+    _obj = _wmo.get("last_object_clicked")
+    if _pop:
+        st.session_state["war_room_side_panel_html"] = _pop
+    elif _tip and _obj:
+        st.session_state["war_room_side_panel_html"] = (
+            f'<div style="font-family:system-ui,ui-sans-serif,sans-serif;font-size:14px;'
+            f'line-height:1.45;color:#eaeaea;"><p style="margin:0;">{html.escape(_tip)}</p></div>'
+        )
+    with _panel_col:
+        st.caption("Map detail")
+        _sel = st.session_state.get("war_room_side_panel_html")
+        if _sel:
+            st.markdown(_sel, unsafe_allow_html=True)
+        else:
+            st.caption(
+                "Click **Port of Trieste** (red Suez chain), **Rotterdam** (blue Cape chain), "
+                "**Shanghai**, **Shenzhen**, or **Strait of Hormuz** to mirror the Folium popup here."
+            )
 
     col_left, col_right = st.columns([1.05, 1.35], gap="large")
 
