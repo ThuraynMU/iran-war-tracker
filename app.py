@@ -17,6 +17,17 @@ from logic import (
     fetch_realtime_shipping_stats,
 )
 
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_portwatch_snapshot():
+    return fetch_realtime_shipping_stats()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_hormuz_stats():
+    return fetch_hormuz_stats()
+
+
 # Sent with RSS fetches so cloud egress IPs are less likely to be blocked by Google News.
 NEWS_RSS_REQUEST_HEADERS: dict[str, str] = {
     "User-Agent": (
@@ -84,7 +95,7 @@ def shipping_impact_table(now_utc: datetime) -> pd.DataFrame:
     }
 
     forced = deadline_window_active(now_utc)
-    pw = fetch_realtime_shipping_stats()
+    pw = _cached_portwatch_snapshot()
     cape_mode = forced or pw.cape_mode
     ports = ["Trieste", "Rotterdam", "Fos-sur-Mer"]
     rows: list[dict] = []
@@ -264,6 +275,14 @@ def fetch_market_watch() -> list[dict]:
     return out
 
 
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_market_watch() -> list[dict]:
+    try:
+        return fetch_market_watch()
+    except Exception:
+        return []
+
+
 def render_market_grid(rows: list[dict]) -> None:
     # Compact grid above the news feed.
     st.markdown("**Targeted Firm Market Monitor**")
@@ -354,8 +373,8 @@ def main() -> None:
         st.session_state.clear()
         st.rerun()
 
-    # Active countdown needs frequent reruns; caches prevent heavy re-fetching.
-    refresh_ms = 1_000 if datetime.now(UTC) < DEADLINE_UTC else 600_000
+    # Countdown updates: avoid 1s reruns on Cloud (duplicates yfinance/RSS work). 5s is enough for T- display.
+    refresh_ms = 5_000 if datetime.now(UTC) < DEADLINE_UTC else 600_000
     st_autorefresh(interval=refresh_ms, key="auto_refresh_dynamic")
 
     now = datetime.now(UTC)
@@ -441,10 +460,7 @@ def main() -> None:
     with st.sidebar:
         st.subheader("Market Watch")
 
-        try:
-            mw = fetch_market_watch()
-        except Exception:
-            mw = []
+        mw = _cached_market_watch()
 
         if mw:
             mw_df = pd.DataFrame(mw)
@@ -477,10 +493,6 @@ def main() -> None:
             st.cache_data.clear()
             st.rerun()
 
-        @st.cache_data(ttl=300, show_spinner=False)
-        def _cached_hormuz_stats():
-            return fetch_hormuz_stats()
-
         hs = _cached_hormuz_stats()
         st.write(f"**As-of (UTC):** {hs.asof_date_utc.strftime('%Y-%m-%d') if hs.asof_date_utc else '—'}")
         st.write(f"**Daily Transits:** {hs.daily_transits_total if hs.daily_transits_total is not None else '—'}")
@@ -497,12 +509,8 @@ def main() -> None:
 
     render_tactical_alert_banner(now)
 
-    # Big-number metrics
-    @st.cache_data(ttl=300, show_spinner=False)
-    def _cached_hormuz_stats_main():
-        return fetch_hormuz_stats()
-
-    hs_main = _cached_hormuz_stats_main()
+    # Big-number metrics (same cache as sidebar — one PortWatch/IMF fetch per TTL, not two)
+    hs_main = _cached_hormuz_stats()
     m1, m2, m3, m4, m5 = st.columns(5, gap="small")
     m1.metric("Hormuz Daily Transits", hs_main.daily_transits_total if hs_main.daily_transits_total is not None else "—")
     m2.metric("Wait-List (Fujairah)", hs_main.wait_list_tankers_fujairah_proxy if hs_main.wait_list_tankers_fujairah_proxy is not None else "—")
@@ -567,13 +575,9 @@ def main() -> None:
         if discerner.war_risk_level.upper() == "CRITICAL":
             st.warning("Market volatility expected to spike at 16:30 GMT.")
 
-        # Compact grid above the news feed (scrolling marquee alternative).
-        try:
-            mw_main = fetch_market_watch()
-        except Exception:
-            mw_main = []
-        if mw_main:
-            render_market_grid(mw_main)
+        # Reuse sidebar’s cached market snapshot (avoid second yfinance bulk download per load).
+        if mw:
+            render_market_grid(mw)
 
         if entries:
             df_news = pd.DataFrame(entries)
