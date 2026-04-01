@@ -16,7 +16,7 @@ from logic import (
     evaluate_strait_status_from_live_entries,
     fetch_live_google_news_multiquery,
     fetch_liveuamap_mideast_kinetic,
-    fetch_newsdata_iran_english,
+    fetch_newsdata_iran_feed,
     fetch_hormuz_stats,
     fetch_realtime_shipping_stats,
 )
@@ -82,6 +82,16 @@ def _newsdata_api_key() -> str | None:
         return str(st.secrets["NEWSDATA_API_KEY"]).strip()
     except Exception:
         return None
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_liveuamap_bundle():
+    return fetch_liveuamap_mideast_kinetic(request_headers=NEWS_RSS_REQUEST_HEADERS)
+
+
+@st.cache_data(ttl=90, show_spinner=False)
+def _cached_newsdata_tehran():
+    return fetch_newsdata_iran_feed(api_key=_newsdata_api_key(), request_headers=NEWS_RSS_REQUEST_HEADERS)
 
 
 def _prepare_intel_dataframe(entries: list[dict]) -> pd.DataFrame | None:
@@ -426,16 +436,8 @@ def main() -> None:
 
     now = datetime.now(UTC)
 
-    @st.cache_data(ttl=120, show_spinner=False)
-    def _cached_liveuamap_bundle():
-        return fetch_liveuamap_mideast_kinetic(request_headers=NEWS_RSS_REQUEST_HEADERS)
-
-    @st.cache_data(ttl=90, show_spinner=False)
-    def _cached_newsdata_tehran():
-        return fetch_newsdata_iran_english(api_key=_newsdata_api_key(), request_headers=NEWS_RSS_REQUEST_HEADERS)
-
     tactical_osint_rows, hormuz_kinetic_flash = _cached_liveuamap_bundle()
-    tehran_official_rows = _cached_newsdata_tehran()
+    tehran_official_rows, newsdata_hint = _cached_newsdata_tehran()
 
     st.markdown(
         """
@@ -685,7 +687,13 @@ def main() -> None:
             with st.container(border=True):
                 st.markdown("### OFFICIAL TEHRAN NARRATIVE")
                 if not tehran_official_rows:
-                    st.caption("No NewsData.io articles. Add `NEWSDATA_API_KEY` to Streamlit secrets (or env) for Iran / English wire.")
+                    if not _newsdata_api_key():
+                        st.caption(
+                            "No NewsData.io articles. Add `NEWSDATA_API_KEY` to Streamlit **Secrets** "
+                            "(or set env) — dashboard: App settings → Secrets."
+                        )
+                    else:
+                        st.caption(newsdata_hint or "NewsData.io returned no rows (check quota / plan).")
                 else:
                     df_t = _prepare_intel_dataframe(tehran_official_rows)
                     if df_t is not None:
@@ -702,7 +710,8 @@ def main() -> None:
                 st.markdown("### KINETIC EVENTS & INTERCEPTIONS")
                 if not tactical_osint_rows:
                     st.caption(
-                        "No kinetic headlines scraped from LiveUAMap Middle East regional pages (public RSS is paywalled)."
+                        "No kinetic headlines yet from LiveUAMap scrapers or Google fallback. "
+                        "If this persists on Cloud, the host may be blocking datacenter IPs — try again after “Clear cache”."
                     )
                 else:
                     df_k = _prepare_intel_dataframe(tactical_osint_rows)

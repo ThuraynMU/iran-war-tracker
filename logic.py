@@ -300,8 +300,13 @@ LIVEUAMAP_SCRAPE_HOME_PAGES: tuple[str, ...] = (
     "https://syria.liveuamap.com/",
 )
 
+# Attribute order varies; Cloudflare/mobile shells sometimes differ slightly.
 _RE_LU_RECD = re.compile(
     r'class="recd_descr"\s+href="(https://[^"]+)"\s+title="([^"]*)"',
+    re.I,
+)
+_RE_LU_RECD_ALT = re.compile(
+    r'class="recd_descr"\s+title="([^"]*)"\s+href="(https://[^"]+)"',
     re.I,
 )
 _RE_COORD_QUERY = re.compile(
@@ -346,6 +351,41 @@ HORMUZ_PROXIMITY_TERMS: tuple[str, ...] = (
     "gulf of oman",
     "oman coast",
 )
+
+# Rotate UAs — some datacenter IPs get a shell page until a desktop UA is used.
+_LU_FETCH_USER_AGENTS: tuple[str, ...] = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+)
+
+
+def _lu_recommend_link_title_pairs(html_text: str) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    for m in _RE_LU_RECD.finditer(html_text):
+        pairs.append((html.unescape(m.group(1).strip()), html.unescape(m.group(2).strip())))
+    for m in _RE_LU_RECD_ALT.finditer(html_text):
+        pairs.append((html.unescape(m.group(2).strip()), html.unescape(m.group(1).strip())))
+    return pairs
+
+
+def _fetch_liveuamap_home_html(url: str, *, timeout_s: float, base_headers: dict[str, str]) -> str | None:
+    for ua in _LU_FETCH_USER_AGENTS:
+        h = {
+            **base_headers,
+            "User-Agent": ua,
+            "Referer": url,
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+        }
+        try:
+            r = requests.get(url, headers=h, timeout=timeout_s)
+            r.raise_for_status()
+            if "recd_descr" in r.text:
+                return r.text
+        except Exception:
+            continue
+    return None
 
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -394,37 +434,10 @@ def kinetic_event_within_hormuz_zone(title: str, link: str) -> bool:
     return _title_implies_hormuz_corridor(title)
 
 
-def fetch_newsdata_iran_english(
-    *,
-    api_key: str | None,
-    timeout_s: float = 22.0,
-    size: int = 28,
-    request_headers: dict[str, str] | None = None,
-) -> list[dict[str, str]]:
-    """NewsData.io latest feed: Iran + English language (official wire often STT)."""
-    if not (api_key or "").strip():
-        return []
-    params: dict[str, str | int] = {
-        "apikey": api_key.strip(),
-        "country": "ir",
-        "language": "en",
-        "size": size,
-    }
-    headers = {
-        **DEFAULT_RSS_REQUEST_HEADERS,
-        **(request_headers or {}),
-        "Accept": "application/json",
-    }
-    try:
-        r = requests.get(NEWSDATA_API_LATEST, params=params, headers=headers, timeout=timeout_s)
-        r.raise_for_status()
-        payload = r.json()
-    except Exception:
-        return []
-    if not isinstance(payload, dict) or payload.get("status") != "success":
-        return []
-    results = payload.get("results") or []
+def _newsdata_rows_from_results(results: Any) -> list[dict[str, str]]:
     out: list[dict[str, str]] = []
+    if not isinstance(results, list):
+        return out
     for row in results:
         if not isinstance(row, dict):
             continue
@@ -445,9 +458,109 @@ def fetch_newsdata_iran_english(
         else:
             source = str(row.get("source_id") or row.get("source_name") or "newsdata.io").strip()
         if title or link:
+            lang = str(row.get("language") or "").strip()
+            if lang:
+                source = f"{source} [{lang}]"
             out.append(_normalized_entry(dt=dt_label, source=source, title=title, link=link))
     out.sort(key=lambda x: _parse_header_date_ts(x.get("Date/Time (UTC)", "")), reverse=True)
     return out
+
+
+def _newsdata_error_from_payload(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return "NewsData.io returned an unexpected payload."
+    if payload.get("status") == "success":
+        return None
+    res = payload.get("results")
+    if isinstance(res, dict):
+        for k in ("message", "msg", "error"):
+            if res.get(k):
+                return str(res[k])
+    for k in ("message", "msg"):
+        if payload.get(k):
+            return str(payload[k])
+    return "NewsData.io status was not success (check API key, plan limits, and parameters)."
+
+
+def fetch_newsdata_iran_feed(
+    *,
+    api_key: str | None,
+    timeout_s: float = 25.0,
+    size: int = 28,
+    request_headers: dict[str, str] | None = None,
+) -> tuple[list[dict[str, str]], str | None]:
+    """
+    NewsData.io: Iran-based publishers. Tries English first; many wires file in other
+    languages, so we fall back to country=ir without a language filter.
+
+    Returns (rows, user_hint). user_hint is None on success with rows, or an error / empty explanation.
+    """
+    if not (api_key or "").strip():
+        return [], None
+
+    key = api_key.strip()
+    headers = {
+        **DEFAULT_RSS_REQUEST_HEADERS,
+        **(request_headers or {}),
+        "Accept": "application/json",
+    }
+    def call(params: dict[str, str | int]) -> tuple[list[dict[str, str]], str | None]:
+        try:
+            r = requests.get(NEWSDATA_API_LATEST, params=params, headers=headers, timeout=timeout_s)
+            r.raise_for_status()
+            payload = r.json()
+        except requests.exceptions.HTTPError as e:
+            txt = ""
+            try:
+                txt = (e.response.text or "")[:300]
+            except Exception:
+                pass
+            return [], f"NewsData.io HTTP {e.response.status_code}. {txt}".strip()
+        except Exception as e:
+            return [], f"NewsData.io request failed: {e!s}"
+
+        err = _newsdata_error_from_payload(payload)
+        if err:
+            return [], err
+        rows = _newsdata_rows_from_results(payload.get("results"))
+        return rows, None
+
+    en_params: dict[str, str | int] = {
+        "apikey": key,
+        "country": "ir",
+        "language": "en",
+        "size": size,
+    }
+    rows_en, err_en = call(en_params)
+    if rows_en:
+        return rows_en, None
+
+    ir_params: dict[str, str | int] = {"apikey": key, "country": "ir", "size": size}
+    rows_ir, err_ir = call(ir_params)
+    if rows_ir:
+        return rows_ir, "No Iran/English-only hits; showing latest Iran-country items (any language, tag in Source)."
+
+    if err_en and err_ir:
+        return [], f"{err_en} | {err_ir}"
+    if err_en:
+        return [], err_en
+    if err_ir:
+        return [], err_ir
+    return [], "NewsData.io returned no Iran articles for English or any-language filters."
+
+
+def fetch_newsdata_iran_english(
+    *,
+    api_key: str | None,
+    timeout_s: float = 25.0,
+    size: int = 28,
+    request_headers: dict[str, str] | None = None,
+) -> list[dict[str, str]]:
+    """Backward-compatible wrapper (rows only). Prefer fetch_newsdata_iran_feed for diagnostics."""
+    rows, _ = fetch_newsdata_iran_feed(
+        api_key=api_key, timeout_s=timeout_s, size=size, request_headers=request_headers
+    )
+    return rows
 
 
 def fetch_liveuamap_mideast_kinetic(
@@ -464,7 +577,7 @@ def fetch_liveuamap_mideast_kinetic(
         **DEFAULT_RSS_REQUEST_HEADERS,
         **(request_headers or {}),
         "Cache-Control": "no-cache",
-        "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     }
     seen_links: set[str] = set()
     ordered: list[dict[str, str]] = []
@@ -472,15 +585,11 @@ def fetch_liveuamap_mideast_kinetic(
     now_stamp = datetime.now(UTC).strftime("%a, %d %b %Y %H:%M:%S GMT")
 
     for home in LIVEUAMAP_SCRAPE_HOME_PAGES:
-        try:
-            r = requests.get(home, headers=headers, timeout=timeout_s)
-            r.raise_for_status()
-        except Exception:
+        html_doc = _fetch_liveuamap_home_html(home, timeout_s=timeout_s, base_headers=headers)
+        if not html_doc:
             continue
         host_seg = (home.split("//", 1)[1].split(".")[0] if "//" in home else "liveuamap").lower()
-        for m in _RE_LU_RECD.finditer(r.text):
-            link = html.unescape(m.group(1).strip())
-            title = html.unescape(m.group(2).strip())
+        for link, title in _lu_recommend_link_title_pairs(html_doc):
             if not title or link in seen_links:
                 continue
             if not _is_kinetic_title(title):
@@ -492,6 +601,39 @@ def fetch_liveuamap_mideast_kinetic(
             ordered.append(_normalized_entry(dt=now_stamp, source=src, title=title, link=link))
             if len(ordered) >= max_items:
                 return ordered, hormuz_kinetic
+
+    if not ordered:
+        try:
+            gq = (
+                "(explosion OR missile OR drone OR intercept OR airstrike OR strike OR blast) "
+                "AND (Iran OR Iraq OR Israel OR Syria OR Lebanon OR Yemen OR Gulf OR Hormuz OR UAE OR Qatar) "
+                "when:1d"
+            )
+            gurl = _google_news_rss_url(gq)
+            for row in fetch_live_rss_entries(
+                gurl, limit=28, timeout_s=timeout_s, request_headers=request_headers
+            ):
+                t = row.get("Title", "") or ""
+                lk = row.get("Link", "") or ""
+                if not _is_kinetic_title(t) or not lk or lk in seen_links:
+                    continue
+                seen_links.add(lk)
+                if kinetic_event_within_hormuz_zone(t, lk):
+                    hormuz_kinetic = True
+                dt = row.get("Date/Time (UTC)") or now_stamp
+                ordered.append(
+                    _normalized_entry(
+                        dt=dt,
+                        source="OSINT fallback (Google News)",
+                        title=t.strip(),
+                        link=lk.strip(),
+                    )
+                )
+                if len(ordered) >= max_items:
+                    break
+        except Exception:
+            pass
+
     return ordered, hormuz_kinetic
 
 
