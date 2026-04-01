@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import math
 import os
 import re
 from dataclasses import dataclass
@@ -670,27 +671,83 @@ WAR_ROOM_SUEZ_BLOCKED_ROUTE_LL: list[list[float]] = [
     [29.9, 32.5],
     [45.6, 13.7],
 ]
-# Asia → Malacca same as Suez branch; Cape → Rotterdam uses Atlantic waypoints (vessel track
-# off West Africa, not a single great-circle chord across the ocean).
-WAR_ROOM_CAPE_ACTIVE_ROUTE_LL: list[list[float]] = [
-    [31.2, 121.5],
-    [22.5, 113.9],
-    [1.3, 103.8],
-    [-34.4, 18.5],
-    [-29.5, 16.5],
-    [-22.0, 13.0],
-    [-12.5, 10.5],
-    [-3.0, 8.5],
-    [5.5, 4.0],
-    [11.5, -2.5],
-    [16.5, -10.0],
-    [22.0, -17.5],
-    [30.0, -18.5],
-    [38.0, -12.0],
-    [45.0, -6.5],
-    [50.0, -1.5],
-    [51.9, 3.9],
+
+
+def _great_circle_polyline(
+    nodes: list[tuple[float, float]],
+    *,
+    steps_per_leg: int = 8,
+) -> list[list[float]]:
+    """
+    Smooth [lat, lon] path through ordered waypoints using short great-circle
+    segments (reads like a vessel track on the map, not kinked rhumb lines).
+    """
+    if len(nodes) < 2:
+        return [[p[0], p[1]] for p in nodes]
+
+    def _leg(lat0: float, lon0: float, lat1: float, lon1: float, n: int) -> list[list[float]]:
+        φ1, λ1 = math.radians(lat0), math.radians(lon0)
+        φ2, λ2 = math.radians(lat1), math.radians(lon1)
+        sin_d = math.sqrt(
+            max(0.0, math.sin((φ2 - φ1) / 2) ** 2)
+            + math.cos(φ1) * math.cos(φ2) * max(0.0, math.sin((λ2 - λ1) / 2) ** 2)
+        )
+        d = 2 * math.asin(min(1.0, sin_d))
+        if d < 1e-8:
+            return [[lat1, lon1]]
+        pts: list[list[float]] = []
+        for i in range(n + 1):
+            f = i / n
+            a = math.sin((1 - f) * d) / math.sin(d)
+            b = math.sin(f * d) / math.sin(d)
+            x = a * math.cos(φ1) * math.cos(λ1) + b * math.cos(φ2) * math.cos(λ2)
+            y = a * math.cos(φ1) * math.sin(λ1) + b * math.cos(φ2) * math.sin(λ2)
+            z = a * math.sin(φ1) + b * math.sin(φ2)
+            lat = math.degrees(math.atan2(z, math.hypot(x, y)))
+            lon = math.degrees(math.atan2(y, x))
+            pts.append([lat, lon])
+        return pts
+
+    out: list[list[float]] = []
+    for i in range(len(nodes) - 1):
+        lat0, lon0 = nodes[i]
+        lat1, lon1 = nodes[i + 1]
+        leg_pts = _leg(lat0, lon0, lat1, lon1, max(2, steps_per_leg))
+        if out:
+            out.extend(leg_pts[1:])
+        else:
+            out.extend(leg_pts)
+    return out
+
+
+# Cape route: Asia → Indian Ocean → Cape of Good Hope → wide Atlantic arc (west of Africa)
+# → Bay of Biscay / SW Approaches → Rotterdam. Interpolation smooths each ocean leg.
+_WAR_ROOM_CAPE_ROUTE_NODES: list[tuple[float, float]] = [
+    (31.2, 121.5),
+    (22.5, 113.9),
+    (1.3, 103.8),
+    (-4.0, 98.0),
+    (-14.0, 87.0),
+    (-24.0, 68.0),
+    (-31.5, 48.0),
+    (-34.2, 32.0),
+    (-34.4, 18.5),
+    (-31.0, 8.5),
+    (-22.0, 0.5),
+    (-11.0, -4.5),
+    (2.0, -12.0),
+    (16.0, -22.0),
+    (30.0, -30.0),
+    (44.0, -28.0),
+    (50.5, -18.0),
+    (52.0, -8.0),
+    (51.6, 0.5),
+    (51.9, 3.9),
 ]
+WAR_ROOM_CAPE_ACTIVE_ROUTE_LL: list[list[float]] = _great_circle_polyline(
+    _WAR_ROOM_CAPE_ROUTE_NODES,
+    steps_per_leg=8,
+)
 WAR_ROOM_CONFLICT_BRANCH_LL: list[list[float]] = [
     [1.3, 103.8],
     [26.6, 56.5],
