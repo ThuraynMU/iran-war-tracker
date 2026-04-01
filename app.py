@@ -1564,41 +1564,13 @@ def main() -> None:
         st.caption(
             "Suez corridor assessed blocked under high kinetic risk; Cape of Good Hope diversion is the active lane (+~20 days)."
         )
-    st.session_state.setdefault("war_room_side_panel_html", None)
-    _wm_col, _panel_col = st.columns([1.65, 1.0], gap="medium")
-    with _wm_col:
-        _war_map_out = streamlit_folium.st_folium(
-            build_tactical_war_room_map(hs_main.trade_value_drop_pct),
-            use_container_width=True,
-            height=460,
-            returned_objects=[
-                "last_object_clicked",
-                "last_object_clicked_popup",
-                "last_object_clicked_tooltip",
-            ],
-            key="war_room_tactical_map",
-        )
-    _wmo = _war_map_out or {}
-    _pop = _wmo.get("last_object_clicked_popup")
-    _tip = _wmo.get("last_object_clicked_tooltip")
-    _obj = _wmo.get("last_object_clicked")
-    if _pop:
-        st.session_state["war_room_side_panel_html"] = _pop
-    elif _tip and _obj:
-        st.session_state["war_room_side_panel_html"] = (
-            f'<div style="font-family:system-ui,ui-sans-serif,sans-serif;font-size:14px;'
-            f'line-height:1.45;color:#eaeaea;"><p style="margin:0;">{html.escape(_tip)}</p></div>'
-        )
-    with _panel_col:
-        st.caption("Map detail")
-        _sel = st.session_state.get("war_room_side_panel_html")
-        if _sel:
-            st.markdown(_sel, unsafe_allow_html=True)
-        else:
-            st.caption(
-                "Click **Port of Trieste** (red Suez chain), **Rotterdam** (blue Cape chain), "
-                "**Shanghai**, **Shenzhen**, or **Strait of Hormuz** to mirror the Folium popup here."
-            )
+    streamlit_folium.st_folium(
+        build_tactical_war_room_map(hs_main.trade_value_drop_pct),
+        use_container_width=True,
+        height=460,
+        returned_objects=[],
+        key="war_room_tactical_map",
+    )
 
     col_left, col_right = st.columns([1.05, 1.35], gap="large")
 
