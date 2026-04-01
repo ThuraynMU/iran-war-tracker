@@ -4,6 +4,9 @@ from calendar import timegm
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
+import html
+import math
+import re
 from typing import Any
 
 import feedparser
@@ -278,6 +281,231 @@ def fetch_live_google_news_multiquery(
 
     merged.sort(key=lambda x: _parse_header_date_ts(x.get("Date/Time (UTC)", "")), reverse=True)
     return merged
+
+
+# --- NewsData.io (Iran / English) + LiveUAMap Middle East scrape -----------------
+
+NEWSDATA_API_LATEST = "https://newsdata.io/api/1/latest"
+
+# Approx. centre Strait of Hormuz for haversine checks when URLs embed coordinates.
+HORMUZ_LAT = 26.75
+HORMUZ_LON = 56.25
+
+# Public /rss on liveuamap.com now redirects to the paid API; home-page HTML still lists incident cards.
+LIVEUAMAP_SCRAPE_HOME_PAGES: tuple[str, ...] = (
+    "https://mideast.liveuamap.com/",
+    "https://iran.liveuamap.com/",
+    "https://israelpalestine.liveuamap.com/",
+    "https://yemen.liveuamap.com/",
+    "https://syria.liveuamap.com/",
+)
+
+_RE_LU_RECD = re.compile(
+    r'class="recd_descr"\s+href="(https://[^"]+)"\s+title="([^"]*)"',
+    re.I,
+)
+_RE_COORD_QUERY = re.compile(
+    r"[?&#](?:lat|latitude)=([-0-9.]+)(?:&[^#]*)?[?&#](?:lng|lon|longitude)=([-0-9.]+)",
+    re.I,
+)
+
+KINETIC_TERMS: tuple[str, ...] = (
+    "explosion",
+    "explosions",
+    "strike",
+    "strikes",
+    "airstrike",
+    "missile",
+    "rocket",
+    "intercept",
+    "air defense",
+    "air-defence",
+    "drone",
+    "kinetic",
+    "blast",
+    "bombed",
+    "shelling",
+    "attack",
+    "wounded",
+    "killed",
+    "airstrikes",
+    "sortie",
+)
+
+HORMUZ_PROXIMITY_TERMS: tuple[str, ...] = (
+    "hormuz",
+    "strait of hormuz",
+    "bandar abbas",
+    "bandar-e abbas",
+    "qeshm",
+    "jask",
+    "chabahar",
+    "fujairah",
+    "musandam",
+    "khasab",
+    "gulf of oman",
+    "oman coast",
+)
+
+
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    r_km = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlmb = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlmb / 2) ** 2
+    return 2 * r_km * math.asin(min(1.0, math.sqrt(a)))
+
+
+def _is_kinetic_title(title: str) -> bool:
+    t = (title or "").lower()
+    return any(k in t for k in KINETIC_TERMS)
+
+
+def _title_implies_hormuz_corridor(title: str) -> bool:
+    t = (title or "").lower()
+    return any(k in t for k in HORMUZ_PROXIMITY_TERMS)
+
+
+def _coords_from_text(blob: str) -> tuple[float, float] | None:
+    m = _RE_COORD_QUERY.search(blob or "")
+    if not m:
+        return None
+    try:
+        lat, lon = float(m.group(1)), float(m.group(2))
+        if -90 <= lat <= 90 and -180 <= lon <= 180:
+            return lat, lon
+    except ValueError:
+        pass
+    return None
+
+
+def kinetic_event_within_hormuz_zone(title: str, link: str) -> bool:
+    """
+    True if the item describes kinetic activity and is within ~50km of Hormuz
+    (coordinates in URL when present, otherwise Hormuz maritime keyword heuristic).
+    """
+    if not _is_kinetic_title(title):
+        return False
+    blob = f"{link} {title}"
+    coords = _coords_from_text(blob)
+    if coords is not None:
+        return haversine_km(coords[0], coords[1], HORMUZ_LAT, HORMUZ_LON) <= 50.0
+    return _title_implies_hormuz_corridor(title)
+
+
+def fetch_newsdata_iran_english(
+    *,
+    api_key: str | None,
+    timeout_s: float = 22.0,
+    size: int = 28,
+    request_headers: dict[str, str] | None = None,
+) -> list[dict[str, str]]:
+    """NewsData.io latest feed: Iran + English language (official wire often STT)."""
+    if not (api_key or "").strip():
+        return []
+    params: dict[str, str | int] = {
+        "apikey": api_key.strip(),
+        "country": "ir",
+        "language": "en",
+        "size": size,
+    }
+    headers = {
+        **DEFAULT_RSS_REQUEST_HEADERS,
+        **(request_headers or {}),
+        "Accept": "application/json",
+    }
+    try:
+        r = requests.get(NEWSDATA_API_LATEST, params=params, headers=headers, timeout=timeout_s)
+        r.raise_for_status()
+        payload = r.json()
+    except Exception:
+        return []
+    if not isinstance(payload, dict) or payload.get("status") != "success":
+        return []
+    results = payload.get("results") or []
+    out: list[dict[str, str]] = []
+    for row in results:
+        if not isinstance(row, dict):
+            continue
+        title = (row.get("title") or "").strip()
+        link = (row.get("link") or "").strip()
+        raw_dt = str(row.get("pubDate") or "").strip()
+        if raw_dt:
+            try:
+                dtn = datetime.strptime(raw_dt[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+                dt_label = dtn.strftime("%a, %d %b %Y %H:%M:%S GMT")
+            except ValueError:
+                dt_label = datetime.now(UTC).strftime("%a, %d %b %Y %H:%M:%S GMT")
+        else:
+            dt_label = datetime.now(UTC).strftime("%a, %d %b %Y %H:%M:%S GMT")
+        creators = row.get("creator")
+        if isinstance(creators, list) and creators:
+            source = ", ".join(str(x) for x in creators[:3] if x)
+        else:
+            source = str(row.get("source_id") or row.get("source_name") or "newsdata.io").strip()
+        if title or link:
+            out.append(_normalized_entry(dt=dt_label, source=source, title=title, link=link))
+    out.sort(key=lambda x: _parse_header_date_ts(x.get("Date/Time (UTC)", "")), reverse=True)
+    return out
+
+
+def fetch_liveuamap_mideast_kinetic(
+    *,
+    timeout_s: float = 20.0,
+    max_items: int = 45,
+    request_headers: dict[str, str] | None = None,
+) -> tuple[list[dict[str, str]], bool]:
+    """
+    Scrape regional LiveUAMap landing pages for kinetic-style cards (RSS is paywalled).
+    Second return value: True if any kinetic headline falls in the Hormuz ~50km rule.
+    """
+    headers = {
+        **DEFAULT_RSS_REQUEST_HEADERS,
+        **(request_headers or {}),
+        "Cache-Control": "no-cache",
+        "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+    }
+    seen_links: set[str] = set()
+    ordered: list[dict[str, str]] = []
+    hormuz_kinetic = False
+    now_stamp = datetime.now(UTC).strftime("%a, %d %b %Y %H:%M:%S GMT")
+
+    for home in LIVEUAMAP_SCRAPE_HOME_PAGES:
+        try:
+            r = requests.get(home, headers=headers, timeout=timeout_s)
+            r.raise_for_status()
+        except Exception:
+            continue
+        host_seg = (home.split("//", 1)[1].split(".")[0] if "//" in home else "liveuamap").lower()
+        for m in _RE_LU_RECD.finditer(r.text):
+            link = html.unescape(m.group(1).strip())
+            title = html.unescape(m.group(2).strip())
+            if not title or link in seen_links:
+                continue
+            if not _is_kinetic_title(title):
+                continue
+            seen_links.add(link)
+            if kinetic_event_within_hormuz_zone(title, link):
+                hormuz_kinetic = True
+            src = f"LiveUAMap ({host_seg})"
+            ordered.append(_normalized_entry(dt=now_stamp, source=src, title=title, link=link))
+            if len(ordered) >= max_items:
+                return ordered, hormuz_kinetic
+    return ordered, hormuz_kinetic
+
+
+def apply_kinetic_hormuz_maximum_override(status: StraitStatus, *, hormuz_kinetic: bool) -> StraitStatus:
+    if not hormuz_kinetic:
+        return status
+    prefix = "Kinetic event within 50km of the Strait of Hormuz (LiveUAMap / Middle East scrape). "
+    return StraitStatus(
+        evaluated_at_utc=status.evaluated_at_utc,
+        war_risk_level="MAXIMUM",
+        strait_status=status.strait_status,
+        rationale=prefix + status.rationale,
+        confirmations=list(status.confirmations),
+    )
 
 
 def evaluate_strait_status(

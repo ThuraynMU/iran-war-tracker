@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import os
 from datetime import UTC, datetime, timedelta
 
 import pandas as pd
@@ -11,8 +12,11 @@ import time
 
 from logic import (
     RELIABILITY_BUFFER_DAYS,
+    apply_kinetic_hormuz_maximum_override,
     evaluate_strait_status_from_live_entries,
     fetch_live_google_news_multiquery,
+    fetch_liveuamap_mideast_kinetic,
+    fetch_newsdata_iran_english,
     fetch_hormuz_stats,
     fetch_realtime_shipping_stats,
 )
@@ -68,6 +72,49 @@ def risk_level_from_score(score: int) -> str:
     if score >= 50:
         return "MEDIUM"
     return "LOW"
+
+
+def _newsdata_api_key() -> str | None:
+    v = (os.environ.get("NEWSDATA_API_KEY") or "").strip()
+    if v:
+        return v
+    try:
+        return str(st.secrets["NEWSDATA_API_KEY"]).strip()
+    except Exception:
+        return None
+
+
+def _prepare_intel_dataframe(entries: list[dict]) -> pd.DataFrame | None:
+    if not entries:
+        return None
+    df_news = pd.DataFrame(entries)
+    if df_news.empty:
+        return None
+    for col in ["Date/Time (UTC)", "Source", "Title", "Link"]:
+        if col not in df_news.columns:
+            df_news[col] = "N/A"
+    raw_dt = df_news["Date/Time (UTC)"].astype(str)
+    cleaned = raw_dt.str.replace(" GMT", "", regex=False).str.strip()
+    _dt = pd.to_datetime(
+        cleaned,
+        errors="coerce",
+        utc=True,
+        format="%a, %d %b %Y %H:%M:%S",
+    )
+    if _dt.isna().all():
+        _dt = pd.to_datetime(raw_dt, errors="coerce", utc=True)
+    df_news = df_news.assign(_dt=_dt).sort_values(by="_dt", ascending=False).reset_index(drop=True)
+    df_news["Date/Time (UTC)"] = df_news["_dt"].dt.strftime("%H:%M GMT").fillna("N/A")
+    df_news = df_news.drop(columns=["_dt"])
+    df_news.insert(0, "No.", range(1, len(df_news) + 1))
+    return df_news
+
+
+def _intel_highlight_row(row):
+    title = str(row.get("Title", "")).lower()
+    if ("target" in title) or ("strike" in title):
+        return ["background-color: rgba(255, 215, 0, 0.22)"] * len(row)
+    return [""] * len(row)
 
 
 def shipping_impact_table(now_utc: datetime) -> pd.DataFrame:
@@ -379,6 +426,17 @@ def main() -> None:
 
     now = datetime.now(UTC)
 
+    @st.cache_data(ttl=120, show_spinner=False)
+    def _cached_liveuamap_bundle():
+        return fetch_liveuamap_mideast_kinetic(request_headers=NEWS_RSS_REQUEST_HEADERS)
+
+    @st.cache_data(ttl=90, show_spinner=False)
+    def _cached_newsdata_tehran():
+        return fetch_newsdata_iran_english(api_key=_newsdata_api_key(), request_headers=NEWS_RSS_REQUEST_HEADERS)
+
+    tactical_osint_rows, hormuz_kinetic_flash = _cached_liveuamap_bundle()
+    tehran_official_rows = _cached_newsdata_tehran()
+
     st.markdown(
         """
         <style>
@@ -451,11 +509,40 @@ def main() -> None:
           }
 
           [data-testid="stHeader"] { background-color: #000000 !important; }
+          [data-testid="stDataFrame"] td,
+          [data-testid="stDataFrame"] th {
+            white-space: normal !important;
+            word-break: break-word !important;
+            vertical-align: top !important;
+          }
           .block-container { padding-top: 1.2rem; }
         </style>
         """,
         unsafe_allow_html=True,
     )
+
+    if hormuz_kinetic_flash:
+        st.markdown(
+            """
+            <style>
+              [data-testid="stHeader"] {
+                background-color: #7a0000 !important;
+                animation: hormuzHeaderFlash 1.1s ease-in-out infinite !important;
+              }
+              @keyframes hormuzHeaderFlash {
+                0%, 100% {
+                  background-color: #3d0000 !important;
+                  box-shadow: 0 0 0 rgba(255, 0, 0, 0);
+                }
+                50% {
+                  background-color: #ff0000 !important;
+                  box-shadow: 0 0 28px rgba(255, 60, 60, 0.95);
+                }
+              }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
 
     with st.sidebar:
         st.subheader("Market Watch")
@@ -537,8 +624,8 @@ def main() -> None:
     with col_right:
         st.subheader("Live Intel Feed")
 
-        cols = st.columns([1, 1, 2])
-        with cols[0]:
+        rb_cols = st.columns([1, 1, 2])
+        with rb_cols[0]:
             if st.button("🔄 Manual Refresh", use_container_width=True):
                 st.cache_data.clear()
                 st.rerun()
@@ -561,6 +648,11 @@ def main() -> None:
 
         entries = _cached_live_entries()
         discerner = evaluate_strait_status_from_live_entries(entries)
+        discerner = apply_kinetic_hormuz_maximum_override(discerner, hormuz_kinetic=hormuz_kinetic_flash)
+
+        if hormuz_kinetic_flash:
+            st.error("Kinetic activity flagged within the Hormuz 50km rule — Discerner risk elevated to MAXIMUM.")
+
         rationale_esc = html.escape(discerner.rationale)
         status_esc = html.escape(discerner.strait_status)
         risk_esc = html.escape(discerner.war_risk_level)
@@ -574,63 +666,73 @@ def main() -> None:
             """,
             unsafe_allow_html=True,
         )
-        if discerner.war_risk_level.upper() == "CRITICAL":
+        if discerner.war_risk_level.upper() in ("CRITICAL", "MAXIMUM"):
             st.warning("Market volatility expected to spike at 16:30 GMT.")
 
-        # Reuse sidebar’s cached market snapshot (avoid second yfinance bulk download per load).
         if mw:
             render_market_grid(mw)
 
-        if entries:
-            df_news = pd.DataFrame(entries)
-            # Safety Net: force ensure all columns exist even if scraper missed one
-            if not df_news.empty:
-                for col in ["Date/Time (UTC)", "Source", "Title", "Link"]:
-                    if col not in df_news.columns:
-                        df_news[col] = "N/A"
+        link_cols = {
+            "No.": st.column_config.NumberColumn("No.", width="small"),
+            "Date/Time (UTC)": st.column_config.TextColumn("Time (UTC)", width="small"),
+            "Title": st.column_config.TextColumn("Title", width="medium"),
+            "Source": st.column_config.TextColumn("Source", width="small"),
+            "Link": st.column_config.LinkColumn("Article", display_text="View Source", help="Open original article"),
+        }
 
-                # Convert to datetime for correct ordering, then format back for display.
-                raw_dt = df_news["Date/Time (UTC)"].astype(str)
-                cleaned = raw_dt.str.replace(" GMT", "", regex=False).str.strip()
-                _dt = pd.to_datetime(
-                    cleaned,
-                    errors="coerce",
-                    utc=True,
-                    format="%a, %d %b %Y %H:%M:%S",
-                )
-                if _dt.isna().all():
-                    _dt = pd.to_datetime(raw_dt, errors="coerce", utc=True)
-                df_news = df_news.assign(_dt=_dt).sort_values(by="_dt", ascending=False).reset_index(drop=True)
-                df_news["Date/Time (UTC)"] = df_news["_dt"].dt.strftime("%H:%M GMT").fillna("N/A")
-                df_news = df_news.drop(columns=["_dt"])
+        pane_l, pane_r = st.columns([1, 1], gap="medium")
+        with pane_l:
+            with st.container(border=True):
+                st.markdown("### OFFICIAL TEHRAN NARRATIVE")
+                if not tehran_official_rows:
+                    st.caption("No NewsData.io articles. Add `NEWSDATA_API_KEY` to Streamlit secrets (or env) for Iran / English wire.")
+                else:
+                    df_t = _prepare_intel_dataframe(tehran_official_rows)
+                    if df_t is not None:
+                        st.dataframe(
+                            df_t[["No.", "Date/Time (UTC)", "Source", "Title", "Link"]].style.apply(
+                                _intel_highlight_row, axis=1
+                            ),
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config=link_cols,
+                        )
+        with pane_r:
+            with st.container(border=True):
+                st.markdown("### KINETIC EVENTS & INTERCEPTIONS")
+                if not tactical_osint_rows:
+                    st.caption(
+                        "No kinetic headlines scraped from LiveUAMap Middle East regional pages (public RSS is paywalled)."
+                    )
+                else:
+                    df_k = _prepare_intel_dataframe(tactical_osint_rows)
+                    if df_k is not None:
+                        st.dataframe(
+                            df_k[["No.", "Date/Time (UTC)", "Source", "Title", "Link"]].style.apply(
+                                _intel_highlight_row, axis=1
+                            ),
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config=link_cols,
+                        )
 
-                # 1-based row numbering at the top.
-                df_news.insert(0, "No.", range(1, len(df_news) + 1))
-
-                def _highlight_row(row):
-                    title = str(row.get("Title", "")).lower()
-                    if ("target" in title) or ("strike" in title):
-                        return ["background-color: rgba(255, 215, 0, 0.22)"] * len(row)
-                    return [""] * len(row)
-
-                st.dataframe(
-                    df_news[["No.", "Date/Time (UTC)", "Source", "Title", "Link"]].style.apply(_highlight_row, axis=1),
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "No.": st.column_config.NumberColumn("No.", width="small"),
-                        "Date/Time (UTC)": st.column_config.TextColumn("Date/Time (UTC)", width="small"),
-                        "Link": st.column_config.LinkColumn(
-                            "Link",
-                            display_text="open",
-                            help="Open the original reports",
+        with st.container(border=True):
+            st.markdown("### Aggregated open-source news (Google RSS + BBC)")
+            if entries:
+                df_news = _prepare_intel_dataframe(entries)
+                if df_news is not None:
+                    st.dataframe(
+                        df_news[["No.", "Date/Time (UTC)", "Source", "Title", "Link"]].style.apply(
+                            _intel_highlight_row, axis=1
                         ),
-                    },
-                )
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config=link_cols,
+                    )
+                else:
+                    st.warning("Waiting for news sync...")
             else:
-                st.warning("Waiting for news sync...")
-        else:
-            st.warning("No RSS entries were fetched.")
+                st.warning("No RSS entries were fetched.")
 
 
 if __name__ == "__main__":
