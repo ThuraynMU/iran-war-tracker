@@ -796,6 +796,17 @@ def main() -> None:
 
     render_tactical_alert_banner(now)
 
+    _top_pad, _top_refresh = st.columns([6, 1], gap="small")
+    with _top_refresh:
+        if st.button(
+            "🔄 Manual Refresh",
+            use_container_width=True,
+            key="manual_refresh_top_right",
+            help="Clear cached RSS, news, and market data and rerun",
+        ):
+            st.cache_data.clear()
+            st.rerun()
+
     # Big-number metrics (same cache as sidebar — one PortWatch/IMF fetch per TTL, not two)
     hs_main = _cached_hormuz_stats()
     m1, m2, col_eu, col_cn, col_us = st.columns([1, 1, 1.35, 1.35, 1.35], gap="small")
@@ -870,12 +881,6 @@ def main() -> None:
 
     with col_right:
         st.subheader("Live Intel Feed")
-
-        rb_cols = st.columns([1, 1, 2])
-        with rb_cols[0]:
-            if st.button("🔄 Manual Refresh", use_container_width=True):
-                st.cache_data.clear()
-                st.rerun()
 
         @st.cache_data(ttl=90, show_spinner=False)
         def _cached_live_entries() -> list[dict]:
