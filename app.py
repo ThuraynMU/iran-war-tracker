@@ -64,6 +64,21 @@ OIL_REMED_IRAQ_KR_TR_MBPD = 0.2  # Kurdistan–Turkey; resumed Mar 18
 # Bar scale for cumulative depletion meter (M bbl); adjust if deficit run extends
 OIL_DEPLETION_METER_SCALE_MMBBL = 650.0
 
+# Global strategic buffer runway (scenario): 1.5B bbl ÷ |net daily deficit| → days to theoretical dry-up
+GLOBAL_STRATEGIC_RESERVE_MMBBL = 1500.0
+
+
+def oil_net_daily_deficit_mbpd() -> float:
+    """Net balance (M bpd): Hormuz + Russia losses + remediation — same basis as Global Oil Inventory Clock."""
+    return (
+        OIL_LOSS_HORMUZ_MBPD
+        + OIL_LOSS_RUSSIA_DRONES_MBPD
+        + OIL_REMED_KSA_YANBU_MBPD
+        + OIL_REMED_AD_HABSHAN_FUJAIRAH_MBPD
+        + OIL_REMED_IRAQ_KR_TR_MBPD
+    )
+
+
 # Secondary shock — Russia (Reuters Apr 2, 2026). Incremental cut *beyond* −1.0 M bpd headline:
 # Discerner adds this many points to Global Panic Score when extra cut ≥ threshold.
 RUSSIA_SECONDARY_SHOCK_REUTERS_DATE = date(2026, 4, 2)
@@ -1029,7 +1044,10 @@ def render_global_oil_inventory_clock(now_utc: datetime) -> None:
         + OIL_REMED_AD_HABSHAN_FUJAIRAH_MBPD
         + OIL_REMED_IRAQ_KR_TR_MBPD
     )
-    net_daily_mbpd = supply_loss + remediation_total
+    net_daily_mbpd = oil_net_daily_deficit_mbpd()
+    buffer_days: float | None = None
+    if net_daily_mbpd < -1e-9:
+        buffer_days = GLOBAL_STRATEGIC_RESERVE_MMBBL / abs(net_daily_mbpd)
     total_depletion_mmbbl = net_daily_mbpd * float(days_since)
     fill_pct = min(
         100.0,
@@ -1038,6 +1056,23 @@ def render_global_oil_inventory_clock(now_utc: datetime) -> None:
 
     _d0 = HORMUZ_OIL_CLOSURE_START_DATE.strftime("%Y-%m-%d")
     _today_s = today.strftime("%Y-%m-%d")
+
+    if buffer_days is not None:
+        _res_fmt = f"{GLOBAL_STRATEGIC_RESERVE_MMBBL:,.0f}"
+        _draw = abs(net_daily_mbpd)
+        _buffer_runway_inner_html = (
+            f'<div><span class="obr-value">{buffer_days:.1f}</span>'
+            f'<span class="obr-unit">days</span></div>'
+            f'<div class="obr-formula">Assumes <b>{_res_fmt} M bbl</b> '
+            f"(1.5 billion bbl) global strategic reserve ÷ "
+            f'<b>{_draw:.1f} M bpd</b> net draw '
+            f"(|net daily deficit|). At constant deficit, theoretical dry-up runway.</div>"
+        )
+    else:
+        _buffer_runway_inner_html = (
+            '<div class="obr-formula">Net balance is not a drawdown — buffer countdown '
+            "does not apply (surplus or balanced scenario).</div>"
+        )
 
     st.markdown(
         f"""
@@ -1107,6 +1142,40 @@ def render_global_oil_inventory_clock(now_utc: datetime) -> None:
             color: #888;
             margin-top: 4px;
           }}
+          .oil-buffer-runway {{
+            margin-top: 14px;
+            padding: 12px 14px 14px 14px;
+            border: 1px dashed #ff8888;
+            border-radius: 10px;
+            background: rgba(60, 0, 0, 0.4);
+          }}
+          .oil-buffer-runway .obr-title {{
+            font-size: 0.78rem;
+            letter-spacing: 0.14em;
+            color: #ffcccc;
+            font-weight: 800;
+            margin-bottom: 6px;
+          }}
+          .oil-buffer-runway .obr-value {{
+            font-size: 2.35rem;
+            font-weight: 900;
+            font-variant-numeric: tabular-nums;
+            color: #ffffff;
+            line-height: 1.1;
+            text-shadow: 0 0 16px rgba(255, 60, 60, 0.65);
+          }}
+          .oil-buffer-runway .obr-unit {{
+            font-size: 1.05rem;
+            color: #ffaaaa;
+            font-weight: 700;
+            margin-left: 4px;
+          }}
+          .oil-buffer-runway .obr-formula {{
+            margin-top: 8px;
+            font-size: 0.88rem;
+            color: #bbb;
+            line-height: 1.35;
+          }}
         </style>
         <div class="global-oil-clock">
           <h2>🛢 GLOBAL OIL INVENTORY CLOCK</h2>
@@ -1133,6 +1202,10 @@ def render_global_oil_inventory_clock(now_utc: datetime) -> None:
           <div class="oil-net">
             Net daily deficit (supply loss + remediation):
             <span style="color:#ff4444;">{net_daily_mbpd:+.1f} M bpd</span>
+          </div>
+          <div class="oil-buffer-runway">
+            <div class="obr-title">DAYS OF GLOBAL BUFFER REMAINING</div>
+            {_buffer_runway_inner_html}
           </div>
           <div class="oil-x33">
             <b>X33 accumulator:</b> ({net_daily_mbpd:+.1f} M bpd) × <b>{days_since}</b> day(s)
