@@ -967,7 +967,6 @@ def shipping_impact_table(now_utc: datetime) -> pd.DataFrame:
 
 
 def render_tactical_alert_banner(now_utc: datetime) -> None:
-    t_str, _is_before = format_countdown(now_utc)
     st.markdown(
         f"""
         <style>
@@ -1006,7 +1005,6 @@ def render_tactical_alert_banner(now_utc: datetime) -> None:
         </style>
         <div class="tacticalBanner">
           <div class="tacticalTitle">🚨 CRITICAL SECURITY THREAT: IRGC 8PM DEADLINE</div>
-          <div class="tacticalTimer">{t_str}  •  16:30 GMT</div>
           <div class="tacticalSub"><b>Intelligence Briefing:</b> The IRGC has designated 18 U.S. and Gulf technology firms as military targets. This shift from military to commercial infrastructure targets (Data Centers/AI Hubs) has triggered an immediate Force Majeure across the region.</div>
         </div>
         """,
