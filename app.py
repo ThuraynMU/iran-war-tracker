@@ -22,6 +22,7 @@ from branca.element import Element
 from logic import (
     RELIABILITY_BUFFER_DAYS,
     DeepStateEnergyHit,
+    UkraineOilInfraScrapeRow,
     apply_kinetic_hormuz_maximum_override,
     evaluate_strait_status_from_live_entries,
     fetch_live_google_news_multiquery,
@@ -29,6 +30,7 @@ from logic import (
     fetch_official_tehran_narrative,
     fetch_hormuz_stats,
     fetch_realtime_shipping_stats,
+    fetch_ukraine_liveuamap_oil_infra_rows,
     get_deepstate_updates,
 )
 
@@ -66,7 +68,7 @@ remedy_iraq_turkey = 0.2
 remedy_uae_fujairah = 0.0  # STATUS: SHUT DOWN
 X33_WINDOW_DAYS = 33
 
-# Industry breakdown (memo): Transport / Industry / Electricity + risk tag for iPad table
+# Industry breakdown for X33 scenario: Transport / Industry / Electricity + risk tag
 X33_INDUSTRY_BREAKDOWN: tuple[tuple[str, str], ...] = (
     ("Transport (60%)", "Critical"),
     ("Industry (25%)", "High"),
@@ -157,6 +159,11 @@ def _newsdata_api_key() -> str | None:
 @st.cache_data(ttl=120, show_spinner=False)
 def _cached_liveuamap_bundle():
     return fetch_liveuamap_mideast_kinetic(request_headers=NEWS_RSS_REQUEST_HEADERS)
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_ukraine_liveuamap_oil_infra_rows() -> list[UkraineOilInfraScrapeRow]:
+    return fetch_ukraine_liveuamap_oil_infra_rows(request_headers=NEWS_RSS_REQUEST_HEADERS)
 
 
 @st.cache_data(ttl=90, show_spinner=False)
@@ -314,14 +321,13 @@ def recent_kinetic_strike_osint_titles(rows: list[dict], *, limit: int = 5) -> l
     return titles
 
 
-def render_osint_kinetic_marquee(rows: list[dict]) -> None:
-    """Top-of-page scrolling ticker: kinetic/strike lines from LiveUAMap / Google OSINT bundle."""
-    titles = recent_kinetic_strike_osint_titles(rows, limit=5)
+def _render_osint_style_marquee(display_lines: list[str], *, empty_fallback: str) -> None:
+    """Shared full-width yellow monospace ticker (same chrome as kinetic OSINT marquee)."""
     sep = "    •    "
-    if not titles:
-        core = html.escape("OSINT: no kinetic/strike-tagged headlines in the current window.")
+    if not display_lines:
+        core = html.escape(empty_fallback)
     else:
-        core = sep.join(html.escape(t) for t in titles)
+        core = sep.join(html.escape(t) for t in display_lines)
     chunk = f'<span class="osint-marquee-text">{core}{sep}</span>'
     st.markdown(
         f"""
@@ -362,6 +368,30 @@ def render_osint_kinetic_marquee(rows: list[dict]) -> None:
         """,
         unsafe_allow_html=True,
     )
+
+
+def render_dashboard_osint_marquee(
+    tactical_rows: list[dict],
+    ukraine_oil_rows: list[UkraineOilInfraScrapeRow],
+) -> None:
+    """
+    Top-of-page ticker: kinetic/strike OSINT plus Ukraine oil-infra headlines (same strip UX).
+    """
+    lines: list[str] = []
+    for t in recent_kinetic_strike_osint_titles(tactical_rows, limit=5):
+        lines.append(t)
+    for r in ukraine_oil_rows[:5]:
+        if r.title:
+            lines.append(f"UA Oil — {r.title}")
+    if not lines:
+        _render_osint_style_marquee(
+            [],
+            empty_fallback=(
+                "OSINT: no kinetic/strike headlines or Ukraine depot/refinery/terminal items in the current window."
+            ),
+        )
+    else:
+        _render_osint_style_marquee(lines, empty_fallback="")
 
 
 def render_bgri_attention_gauge(
@@ -480,6 +510,34 @@ def _intel_highlight_row(row):
     if ("target" in title) or ("strike" in title):
         return ["background-color: rgba(255, 215, 0, 0.22)"] * len(row)
     return [""] * len(row)
+
+
+def _ukraine_oil_intel_highlight_row(row):
+    """Match kinetic intel highlighting; also flag depot / refinery / terminal headlines."""
+    title = str(row.get("Title", "")).lower()
+    if any(
+        k in title
+        for k in ("target", "strike", "refinery", "depot", "terminal", "attack", "fire", "drone")
+    ):
+        return ["background-color: rgba(255, 215, 0, 0.22)"] * len(row)
+    return [""] * len(row)
+
+
+def _ukraine_oil_infra_intel_dataframe(rows: list[UkraineOilInfraScrapeRow]) -> pd.DataFrame | None:
+    if not rows:
+        return None
+    return pd.DataFrame(
+        [
+            {
+                "No.": i,
+                "Date/Time (UTC)": r.time,
+                "Source": "LiveUAMap (Ukraine oil)",
+                "Title": r.title,
+                "Link": r.link,
+            }
+            for i, r in enumerate(rows, start=1)
+        ]
+    )
 
 
 def _trade_drop_split_pcts(raw_val) -> tuple[str, str]:
@@ -632,7 +690,7 @@ def _geojson_feature_subset(full: dict | None, iso_codes: frozenset[str]) -> dic
 
 
 def _war_room_leaflet_contrast_css() -> str:
-    """Dark tooltip / popup chrome for Carto dark tiles + iPad."""
+    """Dark tooltip / popup chrome for Carto dark tiles (high-contrast for outdoor / bright screens)."""
     return """
         <style>
         .leaflet-tooltip {
@@ -869,6 +927,44 @@ def _russia_kinetic_site_popup_html(title: str, body_html_lines: tuple[str, ...]
     )
 
 
+def _add_ukraine_oil_infra_pulse_markers(m: folium.Map, rows: list[UkraineOilInfraScrapeRow]) -> None:
+    """Red pulsing DivIcons — LiveUAMap Ukraine oil-feed rows (depot / refinery / terminal) with resolved coords."""
+    for row in rows:
+        if row.lat is None or row.lon is None:
+            continue
+        safe_u = html.escape(row.link, quote=True) if row.link else ""
+        link_line = (
+            f'<p style="margin-top:8px;">'
+            f'<a href="{safe_u}" target="_blank" rel="noopener noreferrer">Open LiveUAMap</a>'
+            f"</p>"
+            if safe_u
+            else ""
+        )
+        popup_html = (
+            f'<div style="font-family:system-ui,ui-monospace,Menlo,monospace;">'
+            f'<h3 style="color:#ff4444;margin:0 0 8px 0;font-size:15px;">UKRAINE OIL FEED</h3>'
+            f'<p style="margin:4px 0;color:#ddd;font-size:13px;">{html.escape(row.title)}</p>'
+            f'<p style="margin:6px 0 0 0;font-size:12px;color:#aaa;">Time (sidebar): {html.escape(row.time)}</p>'
+            f"{link_line}"
+            f"</div>"
+        )
+        tip = f"UKRAINE OIL FEED\n{row.title}\n{row.time}"
+        pulse_html = (
+            '<div style="width:54px;height:54px;display:flex;align-items:center;'
+            'justify-content:center;">'
+            '<div class="warroom-russia-kinetic-pulse" style="'
+            "width:42px;height:42px;border-radius:50%;"
+            "background:rgba(255,0,0,0.5);border:3px solid #ff0000;"
+            '"></div></div>'
+        )
+        folium.Marker(
+            location=[row.lat, row.lon],
+            icon=folium.DivIcon(html=pulse_html, icon_size=(54, 54), icon_anchor=(27, 27)),
+            tooltip=folium.Tooltip(tip, sticky=True),
+            popup=folium.Popup(popup_html, max_width=320),
+        ).add_to(m)
+
+
 def _add_russia_heatmap_kinetic_markers(m: folium.Map) -> None:
     """Pulsing red markers — Russia OSINT kinetic layer (Yaroslavl, Samara, Ufa)."""
     ufa_popup = _russia_kinetic_site_popup_html(
@@ -975,8 +1071,8 @@ def build_tactical_war_room_map(
     trade_drop_pct: dict[str, float] | None = None,
 ) -> folium.Map:
     """
-    Tactical overlay: Suez/Cape network, Hormuz branch, trade hubs, and Russia heatmap
-    (pulsing refinery kinetic markers: Yaroslavl, Samara/Promsintez, Ufa).
+    Tactical overlay: Suez/Cape network, Hormuz branch, trade hubs, Russia heatmap
+    (Yaroslavl, Samara/Promsintez, Ufa), and LiveUAMap Ukraine oil-infra pulses when coords resolve.
     """
     m = folium.Map(
         location=[15.0, 45.0],
@@ -1066,6 +1162,10 @@ def build_tactical_war_room_map(
 
     _add_hormuz_conflict_marker(m)
     _add_russia_heatmap_kinetic_markers(m)
+    try:
+        _add_ukraine_oil_infra_pulse_markers(m, _cached_ukraine_liveuamap_oil_infra_rows())
+    except Exception:
+        pass
 
     return m
 
@@ -1128,7 +1228,7 @@ def render_tactical_alert_banner(now_utc: datetime) -> None:
 
 
 def render_x33_global_inventory_deficit_gauge() -> None:
-    """Headline iPad metric: X33 accumulated deficit (33 days)."""
+    """Headline X33 accumulated deficit gauge (33-day horizon)."""
     acc = accumulated_33d()
     nd = net_daily_deficit()
     abs_m = abs(acc)
@@ -1176,71 +1276,67 @@ def render_x33_global_inventory_deficit_gauge() -> None:
 
 
 def render_x33_industry_impact_table() -> None:
-    rows = []
+    """
+    HTML table (not st.dataframe) so Streamlit cannot resurrect stale column labels or widget state.
+    """
     status_emoji = {"Critical": "🔴", "High": "🟠", "Moderate": "🟡"}
-    for category, risk in X33_INDUSTRY_BREAKDOWN:
-        rows.append(
-            {
-                "Category": category,
-                "Status": f"{status_emoji.get(risk, '')} {risk}".strip(),
-            }
-        )
-    df = pd.DataFrame(rows)
     st.subheader("X33 industry breakdown")
-    st.caption("Memo sector weights with stress indicators (iPad).")
+    st.caption("Memo sector weights with stress indicators.")
+    parts: list[str] = [
+        "<table style='width:100%;border-collapse:collapse;color:#eeeeee;font-size:1.08rem;'>",
+        "<thead><tr>",
+        "<th style='text-align:left;border-bottom:1px solid #888;padding:10px 8px;color:#fffacd;letter-spacing:0.06em;'>Sector</th>",
+        "<th style='text-align:left;border-bottom:1px solid #888;padding:10px 8px;color:#fffacd;letter-spacing:0.06em;'>Indicator</th>",
+        "</tr></thead><tbody>",
+    ]
+    for category, risk in X33_INDUSTRY_BREAKDOWN:
+        em = (status_emoji.get(risk, "") or "").strip()
+        label = f"{em} {risk}".strip()
+        parts.extend(
+            [
+                "<tr>",
+                f"<td style='border-bottom:1px solid #444;padding:10px 8px;vertical-align:top;'>{html.escape(category)}</td>",
+                f"<td style='border-bottom:1px solid #444;padding:10px 8px;color:#ffff00;font-weight:700;vertical-align:top;'>"
+                f"{html.escape(label)}</td>",
+                "</tr>",
+            ]
+        )
+    parts.append("</tbody></table>")
+    st.markdown("".join(parts), unsafe_allow_html=True)
+
+
+def render_ukraine_oil_infra_intel_panel(
+    oil_rows: list[UkraineOilInfraScrapeRow],
+    *,
+    link_cols: dict,
+) -> None:
+    """
+    Ukraine oil-infra block (no outer border — parent wraps KINETIC + this in one card).
+    """
+    st.markdown("### UKRAINE OIL INFRA — LIVEUAMAP")
+    st.caption(
+        "Depot / refinery / terminal from the Ukraine LiveUAMap sidebar (up to five). "
+        "Tactical map adds red pulses when event pages resolve coordinates."
+    )
+    if not oil_rows:
+        st.caption(
+            "No matching headlines yet from the LiveUAMap Ukraine scrape, or the host blocked the fetch. "
+            "If this persists on Cloud, the datacenter IP may be blocked — try again after clearing cache."
+        )
+        return
+    df_u = _ukraine_oil_infra_intel_dataframe(oil_rows)
+    if df_u is None:
+        return
     st.dataframe(
-        df,
+        df_u[["No.", "Date/Time (UTC)", "Source", "Title", "Link"]].style.apply(
+            _ukraine_oil_intel_highlight_row, axis=1
+        ),
         use_container_width=True,
         hide_index=True,
-        column_config={
-            "Category": st.column_config.TextColumn("Sector (memo share)", width="large"),
-            "Status": st.column_config.TextColumn("Indicator", width="medium"),
-        },
+        column_config=link_cols,
+        column_order=["No.", "Date/Time (UTC)", "Source", "Title", "Link"],
+        key="ukraine_oil_osint_intel_v3",
     )
-
-
-def render_ukraine_osint_kinetic_monitor() -> None:
-    """
-    Russia domestic kinetic/refinery OSINT panel (title reflects Ukraine-adjacent monitor lens).
-    """
-    st.subheader("Ukraine OSINT Kinetic Monitor")
-    with st.container(border=True):
-        st.markdown(
-            """
-            <style>
-              .ua-osint-block h4 {
-                color: #ff6666 !important;
-                font-size: 1.05rem !important;
-                letter-spacing: 0.12em;
-                margin: 14px 0 8px 0;
-                font-weight: 900;
-              }
-              .ua-osint-block p, .ua-osint-block li {
-                color: #eeeeee !important;
-                font-size: 1.05rem !important;
-                line-height: 1.5 !important;
-              }
-              .ua-osint-block ul { margin: 6px 0 0 0; padding-left: 1.2rem; }
-            </style>
-            <div class="ua-osint-block">
-              <h4>REFINERY STRIKE TRACKER</h4>
-              <p><b>Latest event:</b> Drone strike on <b>Ufa Oil Refinery</b>
-              (Bashneft-Novoyl), Bashkortostan.</p>
-              <p><b>Impact:</b> <b>7.3M tonne/year</b> capacity. Large-scale fire confirmed
-              via geolocated Telegram footage (<b>April 2, 2026</b>).</p>
-              <h4>PORT INFRASTRUCTURE ALERT</h4>
-              <p><b>Status:</b> <b>Ust-Luga</b> and <b>Primorsk</b> (Baltic Sea) exports
-              <b>suspended</b>. Drone strikes have &quot;choked&quot; the pipeline system.</p>
-              <h4>EXPORT BAN TRIGGER</h4>
-              <p>Russia has officially suspended <b>all gasoline exports</b> as of
-              <b>April 1, 2026</b>, attributed to these domestic refinery losses.</p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        st.caption(
-            "Russia heatmap on the tactical map: pulsing red markers at Yaroslavl, Samara (Promsintez), and Ufa."
-        )
 
 
 def render_global_oil_inventory_clock(now_utc: datetime) -> None:
@@ -1768,14 +1864,15 @@ def main() -> None:
     tactical_osint_rows, hormuz_kinetic_flash = _cached_liveuamap_bundle()
     tehran_official_rows, tehran_feed_caption = _cached_tehran_narrative()
     bgri_live_entries = _cached_live_entries()
+    ukraine_oil_rows = _cached_ukraine_liveuamap_oil_infra_rows()
 
     st.markdown(
         '<div style="height:0.35rem" aria-hidden="true"></div>',
         unsafe_allow_html=True,
     )
 
-    # First on the page: kinetic marquee, then manual refresh (per tablet spacing)
-    render_osint_kinetic_marquee(tactical_osint_rows)
+    # First on the page: combined OSINT marquee (kinetic + Ukraine oil infra), then manual refresh
+    render_dashboard_osint_marquee(tactical_osint_rows, ukraine_oil_rows)
 
     _top_pad, _top_refresh = st.columns([7, 1], gap="small")
     with _top_refresh:
@@ -1796,8 +1893,7 @@ def main() -> None:
         """
         <style>
           /*
-            High contrast for tablets: drive Streamlit's own tokens so widgets use
-            white text on black (custom CSS was fighting var(--st-text-color)).
+            High-contrast theme: drive Streamlit tokens so widgets use white on black.
             Do not hide stToolbar — it can collapse the main flex layout on some builds.
           */
           :root {
@@ -1935,9 +2031,9 @@ def main() -> None:
     render_x33_global_inventory_deficit_gauge()
     render_global_oil_inventory_clock(now)
     render_x33_industry_impact_table()
-    render_ukraine_osint_kinetic_monitor()
 
     with st.sidebar:
+        st.caption("UI build 2026-04-02c — if missing, Streamlit is not using this app.py")
         st.subheader("DEEPSTATE KINETIC FEED")
         _ds_hits = _cached_deepstate_energy_hits()[:3]
         if not _ds_hits:
@@ -2081,7 +2177,8 @@ def main() -> None:
 
     st.subheader("War Room — Tactical Shipping Map")
     st.caption(
-        "Includes **Russia heatmap** layer: pulsing red markers — Yaroslavl, Samara (Promsintez), Ufa."
+        "Includes **Russia heatmap** (Yaroslavl, Samara/Promsintez, Ufa) and **LiveUAMap Ukraine oil feed** "
+        "(depot/refinery/terminal in the top sidebar slice) as additional red pulses when coordinates resolve."
     )
     _dl = now - DEADLINE_UTC
     if _dl.total_seconds() > 0:
@@ -2198,6 +2295,7 @@ def main() -> None:
                             key="official_tehran_narrative",
                         )
         with pane_r:
+            # Single bordered card: kinetic table + Ukraine table (same column width as Tehran | this row)
             with st.container(border=True):
                 st.markdown("### KINETIC EVENTS & INTERCEPTIONS")
                 if not tactical_osint_rows:
@@ -2217,6 +2315,8 @@ def main() -> None:
                             column_config=link_cols,
                             key="kinetic_osint_intel",
                         )
+                st.markdown('<div style="height:14px"></div>', unsafe_allow_html=True)
+                render_ukraine_oil_infra_intel_panel(ukraine_oil_rows, link_cols=link_cols)
 
         with st.container(border=True):
             st.markdown("### Aggregated open-source news (Google RSS + BBC)")

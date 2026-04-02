@@ -48,6 +48,17 @@ class StraitStatus:
     confirmations: list[str]
 
 
+@dataclass(frozen=True)
+class UkraineOilInfraScrapeRow:
+    """LiveUAMap Ukraine feed: sidebar card time/title/link plus optional map coordinates from the event page."""
+
+    time: str
+    title: str
+    link: str
+    lat: float | None
+    lon: float | None
+
+
 GOOGLE_NEWS_HORMUZ_RSS_URL = (
     "https://news.google.com/rss/search?q=Iran+war+Strait+of+Hormuz+shipping&hl=en-US&gl=US&ceid=US:en"
 )
@@ -336,6 +347,17 @@ LIVEUAMAP_SCRAPE_HOME_PAGES: tuple[str, ...] = (
     "https://syria.liveuamap.com/",
 )
 
+# Ukraine "oil" path is often a shell/404; `/en` still ships the live sidebar (`div.event`) HTML.
+LIVEUAMAP_UKRAINE_OIL_TARGET_URL = "https://ukraine.liveuamap.com/en/event/oil"
+LIVEUAMAP_UKRAINE_HOME_EN_URL = "https://ukraine.liveuamap.com/en"
+
+_UKRAINE_OIL_INFRA_KEYWORDS: tuple[str, ...] = ("depot", "refinery", "terminal")
+
+_RE_LU_EVENT_PAGE_LATLNG = re.compile(
+    r"lat\s*=\s*([-0-9.]+)\s*;\s*lng\s*=\s*([-0-9.]+)\s*;",
+    re.I,
+)
+
 # Attribute order varies; Cloudflare/mobile shells sometimes differ slightly.
 _RE_LU_RECD = re.compile(
     r'class="recd_descr"\s+href="(https://[^"]+)"\s+title="([^"]*)"',
@@ -422,6 +444,124 @@ def _fetch_liveuamap_home_html(url: str, *, timeout_s: float, base_headers: dict
         except Exception:
             continue
     return None
+
+
+def _fetch_liveuamap_ukraine_sidebar_html(
+    url: str, *, timeout_s: float, base_headers: dict[str, str]
+) -> str | None:
+    """First page that returns HTTP 200 and includes sidebar `div.event` markup."""
+    for ua in _LU_FETCH_USER_AGENTS:
+        h = {
+            **base_headers,
+            "User-Agent": ua,
+            "Referer": url,
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+        }
+        try:
+            r = requests.get(url, headers=h, timeout=timeout_s)
+            r.raise_for_status()
+            if 'class="event' in r.text or "class='event" in r.text:
+                return r.text
+        except Exception:
+            continue
+    return None
+
+
+def _liveuamap_abs_url(url: str) -> str:
+    u = (url or "").strip()
+    if u.startswith("//"):
+        return f"https:{u}"
+    return u
+
+
+def _liveuamap_event_page_latlng(
+    page_url: str, *, timeout_s: float, base_headers: dict[str, str]
+) -> tuple[float, float] | None:
+    """
+    Event detail pages embed the incident map centre as:
+        lat=…; lng=…; inside $(document).ready
+    """
+    dest = _liveuamap_abs_url(page_url)
+    if not dest:
+        return None
+    for ua in _LU_FETCH_USER_AGENTS:
+        h = {
+            **base_headers,
+            "User-Agent": ua,
+            "Referer": dest,
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+        }
+        try:
+            r = requests.get(dest, headers=h, timeout=timeout_s)
+            r.raise_for_status()
+            m = _RE_LU_EVENT_PAGE_LATLNG.search(r.text)
+            if not m:
+                continue
+            lat, lon = float(m.group(1)), float(m.group(2))
+            if -90 <= lat <= 90 and -180 <= lon <= 180:
+                return lat, lon
+        except Exception:
+            continue
+    return None
+
+
+def fetch_ukraine_liveuamap_oil_infra_rows(
+    *,
+    timeout_s: float = 22.0,
+    request_headers: dict[str, str] | None = None,
+    top_n: int = 5,
+    max_scan: int = 40,
+) -> list[UkraineOilInfraScrapeRow]:
+    """
+    Scrape https://ukraine.liveuamap.com/en/event/oil when it serves sidebar cards;
+    otherwise fall back to https://ukraine.liveuamap.com/en.
+
+    Walks sidebar ``div.event`` nodes in order (most recent first). Keeps up to
+    ``top_n`` rows whose titles mention depot, refinery, or terminal
+    (case-insensitive), scanning at most ``max_scan`` cards. Resolves coordinates
+    from each LiveUAMap detail page when possible (incident map centre).
+    """
+    headers = {
+        **DEFAULT_RSS_REQUEST_HEADERS,
+        **(request_headers or {}),
+        "Cache-Control": "no-cache",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    html_doc: str | None = None
+    for home in (LIVEUAMAP_UKRAINE_OIL_TARGET_URL, LIVEUAMAP_UKRAINE_HOME_EN_URL):
+        html_doc = _fetch_liveuamap_ukraine_sidebar_html(
+            home, timeout_s=timeout_s, base_headers=headers
+        )
+        if html_doc:
+            break
+    if not html_doc:
+        return []
+
+    soup = BeautifulSoup(html_doc, "html.parser")
+    events = soup.select("div.event")[:max_scan]
+    rows: list[UkraineOilInfraScrapeRow] = []
+    for ev in events:
+        if len(rows) >= top_n:
+            break
+        title_el = ev.select_one("div.title")
+        raw_title = (title_el.get_text(" ", strip=True) if title_el else "").strip()
+        if not raw_title:
+            continue
+        tl = raw_title.lower()
+        if not any(k in tl for k in _UKRAINE_OIL_INFRA_KEYWORDS):
+            continue
+        time_el = ev.select_one("span.date_add")
+        time_s = (time_el.get_text(" ", strip=True) if time_el else "").strip() or "—"
+        link = _liveuamap_abs_url((ev.get("data-link") or "").strip())
+        if not link:
+            continue
+        coords = _liveuamap_event_page_latlng(link, timeout_s=timeout_s, base_headers=headers)
+        lat, lon = (coords[0], coords[1]) if coords else (None, None)
+        rows.append(UkraineOilInfraScrapeRow(time=time_s, title=raw_title, link=link, lat=lat, lon=lon))
+
+    return rows
 
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
