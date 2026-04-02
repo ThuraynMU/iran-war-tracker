@@ -5,7 +5,7 @@ import math
 import os
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from email.utils import parsedate_to_datetime
 
 import folium
@@ -52,6 +52,17 @@ NEWS_RSS_REQUEST_HEADERS: dict[str, str] = {
 }
 
 DEADLINE_UTC = datetime(2026, 4, 1, 16, 30, tzinfo=UTC)  # 16:30 GMT == 20:00 Tehran
+
+# Global Oil Inventory Clock — scenario constants (M bbl/d)
+HORMUZ_OIL_CLOSURE_START_DATE = date(2026, 3, 1)
+OIL_LOSS_HORMUZ_MBPD = -21.0
+OIL_LOSS_RUSSIA_DRONES_MBPD = -1.0
+OIL_REMED_KSA_YANBU_MBPD = 7.0  # East–West pipeline; max capacity reached Mar 28
+OIL_REMED_AD_HABSHAN_FUJAIRAH_MBPD = 0.0  # SHUT DOWN — Fujairah drone damage
+OIL_REMED_IRAQ_KR_TR_MBPD = 0.2  # Kurdistan–Turkey; resumed Mar 18
+
+# Bar scale for cumulative depletion meter (M bbl); adjust if deficit run extends
+OIL_DEPLETION_METER_SCALE_MMBBL = 650.0
 
 
 def deadline_window_active(now_utc: datetime) -> bool:
@@ -971,6 +982,141 @@ def render_tactical_alert_banner(now_utc: datetime) -> None:
     return
 
 
+def render_global_oil_inventory_clock(now_utc: datetime) -> None:
+    """
+    Top-of-dashboard synthetic oil balance: supply shock vs bypass/remediation,
+    net daily deficit, and X33-style cumulative depletion since Hormuz closure anchor.
+    """
+    today = now_utc.date()
+    days_since = max(0, (today - HORMUZ_OIL_CLOSURE_START_DATE).days)
+
+    supply_loss = OIL_LOSS_HORMUZ_MBPD + OIL_LOSS_RUSSIA_DRONES_MBPD
+    remediation_total = (
+        OIL_REMED_KSA_YANBU_MBPD
+        + OIL_REMED_AD_HABSHAN_FUJAIRAH_MBPD
+        + OIL_REMED_IRAQ_KR_TR_MBPD
+    )
+    net_daily_mbpd = supply_loss + remediation_total
+    total_depletion_mmbbl = net_daily_mbpd * float(days_since)
+    fill_pct = min(
+        100.0,
+        max(0.0, abs(total_depletion_mmbbl) / OIL_DEPLETION_METER_SCALE_MMBBL * 100.0),
+    )
+
+    _d0 = HORMUZ_OIL_CLOSURE_START_DATE.strftime("%Y-%m-%d")
+    _today_s = today.strftime("%Y-%m-%d")
+
+    st.markdown(
+        f"""
+        <style>
+          .global-oil-clock {{
+            border: 2px solid #ff2222;
+            border-radius: 14px;
+            background: linear-gradient(180deg, rgba(40,0,0,0.55) 0%, rgba(10,0,0,0.9) 100%);
+            padding: 16px 18px 18px 18px;
+            margin: 0 0 14px 0;
+            box-shadow: 0 0 24px rgba(255, 30, 30, 0.35);
+          }}
+          .global-oil-clock h2 {{
+            margin: 0 0 10px 0;
+            font-size: 1.35rem;
+            letter-spacing: 0.12em;
+            color: #fff0f0;
+            font-weight: 900;
+          }}
+          .global-oil-clock .oil-row {{
+            font-size: 1.05rem;
+            color: #f5f5f5;
+            margin: 4px 0;
+            line-height: 1.45;
+          }}
+          .global-oil-clock .oil-sub {{
+            font-size: 0.95rem;
+            color: #c8c8c8;
+            margin: 2px 0 8px 12px;
+            line-height: 1.4;
+          }}
+          .global-oil-clock .oil-net {{
+            margin-top: 10px;
+            font-size: 1.15rem;
+            font-weight: 800;
+            color: #ffff00;
+          }}
+          .global-oil-clock .oil-x33 {{
+            margin-top: 6px;
+            font-size: 1.05rem;
+            color: #ffffff;
+          }}
+          .oil-meter-wrap {{
+            margin-top: 14px;
+            border: 1px solid #ff4444;
+            border-radius: 10px;
+            height: 28px;
+            background: #1a0505;
+            overflow: hidden;
+          }}
+          .oil-meter-fill {{
+            height: 100%;
+            width: {fill_pct:.1f}%;
+            background: linear-gradient(90deg, #ff0000 0%, #ff4444 50%, #ff0000 100%);
+            box-shadow: 0 0 18px rgba(255, 0, 0, 0.85);
+            transition: width 0.4s ease-out;
+          }}
+          .oil-meter-label {{
+            margin-top: 8px;
+            font-size: 1.25rem;
+            font-weight: 900;
+            color: #ff3333;
+            text-shadow: 0 0 12px rgba(255, 0, 0, 0.55);
+          }}
+          .oil-meter-cap {{
+            font-size: 0.82rem;
+            color: #888;
+            margin-top: 4px;
+          }}
+        </style>
+        <div class="global-oil-clock">
+          <h2>🛢 GLOBAL OIL INVENTORY CLOCK</h2>
+          <div class="oil-row">
+            <b>Daily supply loss:</b>
+            {OIL_LOSS_HORMUZ_MBPD:+.1f} M bpd (Hormuz) ·
+            {OIL_LOSS_RUSSIA_DRONES_MBPD:+.1f} M bpd (Russia drone strikes)
+            &nbsp;→&nbsp;<b>{supply_loss:+.1f} M bpd</b>
+          </div>
+          <div class="oil-row" style="margin-top:10px;"><b>Daily remediation (bypass)</b></div>
+          <div class="oil-sub">
+            • KSA East–West Pipeline (Yanbu): <b>+{OIL_REMED_KSA_YANBU_MBPD:.1f} M bpd</b>
+            — max capacity reached Mar 28.
+          </div>
+          <div class="oil-sub">
+            • Abu Dhabi (Habshan–Fujairah): <b>+{OIL_REMED_AD_HABSHAN_FUJAIRAH_MBPD:.1f} M bpd</b>
+            — <span style="color:#ff6666;">STATUS: SHUT DOWN</span>
+            (drone damage at Fujairah terminal).
+          </div>
+          <div class="oil-sub">
+            • Iraq (Kurdistan–Turkey): <b>+{OIL_REMED_IRAQ_KR_TR_MBPD:.1f} M bpd</b>
+            — resumed Mar 18.
+          </div>
+          <div class="oil-net">
+            Net daily deficit (supply loss + remediation):
+            <span style="color:#ff4444;">{net_daily_mbpd:+.1f} M bpd</span>
+          </div>
+          <div class="oil-x33">
+            <b>X33 accumulator:</b> ({net_daily_mbpd:+.1f} M bpd) × <b>{days_since}</b> day(s)
+            since Hormuz closure ({html.escape(_d0)}) &nbsp;·&nbsp; as-of {html.escape(_today_s)} UTC date
+            &nbsp;→&nbsp;<b style="color:#ff5555;">{total_depletion_mmbbl:+.1f} M bbl</b> cumulative.
+          </div>
+          <div class="oil-meter-wrap" title="Total inventory depletion (cumulative, scenario)">
+            <div class="oil-meter-fill"></div>
+          </div>
+          <div class="oil-meter-label">Total inventory depletion: {total_depletion_mmbbl:+.1f} M bbl</div>
+          <div class="oil-meter-cap">Meter scale: 0–{OIL_DEPLETION_METER_SCALE_MMBBL:.0f} M bbl (bright red = cumulative draw severity).</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def _safe_float(x) -> float | None:
     try:
         return float(x)
@@ -1448,6 +1594,8 @@ def main() -> None:
             """,
             unsafe_allow_html=True,
         )
+
+    render_global_oil_inventory_clock(now)
 
     render_osint_kinetic_marquee(tactical_osint_rows)
 
