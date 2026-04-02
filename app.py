@@ -64,6 +64,20 @@ OIL_REMED_IRAQ_KR_TR_MBPD = 0.2  # Kurdistan–Turkey; resumed Mar 18
 # Bar scale for cumulative depletion meter (M bbl); adjust if deficit run extends
 OIL_DEPLETION_METER_SCALE_MMBBL = 650.0
 
+# Secondary shock — Russia (Reuters Apr 2, 2026). Incremental cut *beyond* −1.0 M bpd headline:
+# Discerner adds this many points to Global Panic Score when extra cut ≥ threshold.
+RUSSIA_SECONDARY_SHOCK_REUTERS_DATE = date(2026, 4, 2)
+RUSSIA_DISCERNER_EXTRA_CUT_THRESHOLD_MBPD = 0.5
+RUSSIA_DISCERNER_GLOBAL_PANIC_BUMP = 10
+# Scenario knob: set ≥0.5 to simulate “another 500k” and show +10 on the gauge.
+RUSSIA_SCENARIO_ADDITIONAL_CUT_MBPD = 0.0
+
+
+def russia_discerner_global_panic_bonus(additional_cut_mbpd: float) -> int:
+    if additional_cut_mbpd + 1e-9 >= RUSSIA_DISCERNER_EXTRA_CUT_THRESHOLD_MBPD:
+        return RUSSIA_DISCERNER_GLOBAL_PANIC_BUMP
+    return 0
+
 
 def deadline_window_active(now_utc: datetime) -> bool:
     return now_utc <= (DEADLINE_UTC + timedelta(hours=24))
@@ -300,13 +314,20 @@ def render_osint_kinetic_marquee(rows: list[dict]) -> None:
     )
 
 
-def render_bgri_attention_gauge(bgri: BgriResult) -> None:
-    """Top-of-dash gauge: digesting (green) vs spiraling (red)."""
-    if bgri.score > 70:
+def render_bgri_attention_gauge(
+    bgri: BgriResult,
+    *,
+    russia_additional_cut_mbpd: float = RUSSIA_SCENARIO_ADDITIONAL_CUT_MBPD,
+) -> None:
+    """Top-of-dash gauge: BGRI base + Discerner Global Panic bump (Russia incremental cut rule)."""
+    _panic_bump = russia_discerner_global_panic_bonus(russia_additional_cut_mbpd)
+    global_panic = min(100, max(0, bgri.score + _panic_bump))
+
+    if global_panic > 70:
         val_color = "#ff3b3b"
         bar_color = "linear-gradient(90deg, #ffdd00 0%, #ff3b3b 100%)"
         fw = "900"
-    elif bgri.score < 30:
+    elif global_panic < 30:
         val_color = "#2ee85a"
         bar_color = "linear-gradient(90deg, #1a6b32 0%, #2ee85a 100%)"
         fw = "700"
@@ -315,7 +336,7 @@ def render_bgri_attention_gauge(bgri: BgriResult) -> None:
         bar_color = "linear-gradient(90deg, #c9a000 0%, #fffacd 100%)"
         fw = "800"
 
-    pct = max(0, min(100, bgri.score))
+    pct = max(0, min(100, global_panic))
     arc_angle = 180.0 * (pct / 100.0)
     # SVG semicircle gauge (0–180° sweep)
     svg = f"""
@@ -323,17 +344,28 @@ def render_bgri_attention_gauge(bgri: BgriResult) -> None:
       <path d="M 40 130 A 100 100 0 0 1 240 130" fill="none" stroke="#333333" stroke-width="14" stroke-linecap="round"/>
       <path d="M 40 130 A 100 100 0 0 1 240 130" fill="none" stroke="{val_color}" stroke-width="14"
             stroke-linecap="round" stroke-dasharray="{314.16 * (arc_angle / 180.0):.1f} 314.16"/>
-      <text x="140" y="118" text-anchor="middle" fill="{val_color}" font-size="36" font-weight="{fw}" font-family="system-ui,sans-serif">{bgri.score}</text>
+      <text x="140" y="118" text-anchor="middle" fill="{val_color}" font-size="36" font-weight="{fw}" font-family="system-ui,sans-serif">{global_panic}</text>
       <text x="140" y="142" text-anchor="middle" fill="#aaaaaa" font-size="11" letter-spacing="0.12em">0 DIGEST</text>
       <text x="250" y="142" text-anchor="end" fill="#aaaaaa" font-size="11" letter-spacing="0.12em">PANIC 100</text>
     </svg>
     """
 
     with st.container(border=True):
-        st.markdown("### MARKET ATTENTION SCORE (BGRI)")
+        st.markdown("### GLOBAL PANIC SCORE (BGRI + DISCERNER)")
         st.caption(
-            f"Flashpoint keyword hits in last {bgri.headline_sample_size} de‑duplicated headlines "
-            f"(Google RSS + Tehran + kinetic OSINT) vs {BGRI_BASELINE_HITS:g}-hit 30‑day baseline proxy."
+            f"**BGRI base:** {bgri.score}/100 from flashpoint keyword hits in last {bgri.headline_sample_size} "
+            f"de‑duplicated headlines (Google RSS + Tehran + kinetic OSINT) vs {BGRI_BASELINE_HITS:g}-hit baseline. "
+            f"**Shown:** {global_panic}/100"
+            + (
+                f" (includes **+{_panic_bump}** Russia secondary-shock Discerner — incremental cut "
+                f"≥ {RUSSIA_DISCERNER_EXTRA_CUT_THRESHOLD_MBPD:g} M bpd)."
+                if _panic_bump
+                else (
+                    f". Discerner: +{RUSSIA_DISCERNER_GLOBAL_PANIC_BUMP} if Russia loses another "
+                    f"≥ {RUSSIA_DISCERNER_EXTRA_CUT_THRESHOLD_MBPD:g} M bpd "
+                    f"(set RUSSIA_SCENARIO_ADDITIONAL_CUT_MBPD in app.py to stress-test)."
+                )
+            )
         )
         g1, g2 = st.columns([1.15, 1.0], gap="large")
         with g1:
@@ -345,12 +377,13 @@ def render_bgri_attention_gauge(bgri: BgriResult) -> None:
             )
         with g2:
             st.markdown(
-                '<p style="font-size:0.95rem;color:#c8c8c8;margin:0 0 6px 0;">Attention index (0–100)</p>',
+                '<p style="font-size:0.95rem;color:#c8c8c8;margin:0 0 6px 0;">'
+                "Global Panic Score (0–100)</p>",
                 unsafe_allow_html=True,
             )
             st.markdown(
                 f'<p style="margin:0;font-size:2.75rem;font-weight:{fw};color:{val_color};line-height:1.05;">'
-                f"{bgri.score}</p>",
+                f"{global_panic}</p>",
                 unsafe_allow_html=True,
             )
             st.markdown(
@@ -1117,6 +1150,69 @@ def render_global_oil_inventory_clock(now_utc: datetime) -> None:
     )
 
 
+def render_secondary_shock_russian_output_card() -> None:
+    """Reuters-sourced Russian export shock; Discerner rule for Global Panic Score."""
+    mo = RUSSIA_SECONDARY_SHOCK_REUTERS_DATE.strftime("%B")
+    d = RUSSIA_SECONDARY_SHOCK_REUTERS_DATE.day
+    y = RUSSIA_SECONDARY_SHOCK_REUTERS_DATE.year
+    _src = f"{mo} {d}, {y}"
+    st.markdown(
+        f"""
+        <style>
+          .russia-secondary-card {{
+            border: 2px solid #8b7355;
+            border-radius: 14px;
+            background: linear-gradient(165deg, rgba(35,28,20,0.92) 0%, rgba(12,10,8,0.96) 100%);
+            padding: 16px 18px 18px 18px;
+            margin: 0 0 14px 0;
+            box-shadow: 0 0 18px rgba(200, 160, 90, 0.18);
+          }}
+          .russia-secondary-card h3 {{
+            margin: 0 0 8px 0;
+            font-size: 1.12rem;
+            letter-spacing: 0.11em;
+            color: #f5e6c8;
+            font-weight: 900;
+          }}
+          .russia-secondary-card .rs-line {{
+            font-size: 1.05rem;
+            color: #eee;
+            margin: 6px 0;
+            line-height: 1.5;
+          }}
+          .russia-secondary-card .rs-discerner {{
+            margin-top: 12px;
+            padding: 10px 12px;
+            border-left: 4px solid #ff9800;
+            background: rgba(255, 152, 0, 0.08);
+            font-size: 1.02rem;
+            color: #ffe0b2;
+            line-height: 1.45;
+          }}
+          .russia-secondary-card .rs-status {{
+            color: #ffab91;
+            font-weight: 800;
+            font-size: 1.08rem;
+          }}
+        </style>
+        <div class="russia-secondary-card">
+          <h3>SECONDARY SHOCK: RUSSIAN OUTPUT</h3>
+          <div class="rs-line"><b>Source:</b> Reuters ({html.escape(_src)}).</div>
+          <div class="rs-line rs-status">
+            Status: {OIL_LOSS_RUSSIA_DRONES_MBPD:+.1f} M bpd output cut — &quot;unavoidable&quot; drone strikes
+            on export infrastructure.
+          </div>
+          <div class="rs-discerner">
+            <b>Discerner logic:</b> If Russia&apos;s output drops another
+            {RUSSIA_DISCERNER_EXTRA_CUT_THRESHOLD_MBPD:.1f} M bpd, increase the
+            <b>Global Panic Score</b> by <b>{RUSSIA_DISCERNER_GLOBAL_PANIC_BUMP}</b> points.
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def _safe_float(x) -> float | None:
     try:
         return float(x)
@@ -1596,6 +1692,7 @@ def main() -> None:
         )
 
     render_global_oil_inventory_clock(now)
+    render_secondary_shock_russian_output_card()
 
     render_osint_kinetic_marquee(tactical_osint_rows)
 
