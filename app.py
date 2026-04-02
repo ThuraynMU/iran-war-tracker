@@ -670,6 +670,10 @@ def _war_room_leaflet_contrast_css() -> str:
           box-shadow: 0 0 20px rgba(255, 0, 0, 0.95);
           animation: warroomTriesteBlink 0.85s ease-in-out infinite;
         }
+        .warroom-russia-kinetic-pulse {
+          box-shadow: 0 0 24px rgba(255, 0, 0, 0.98);
+          animation: warroomTriesteBlink 0.9s ease-in-out infinite;
+        }
         @keyframes warroomPulse {
           0%, 100% { transform: scale(1); opacity: 0.95; }
           50% { transform: scale(1.38); opacity: 0.42; }
@@ -841,6 +845,63 @@ WAR_ROOM_CONFLICT_BRANCH_LL: list[list[float]] = [
 ]
 WAR_ROOM_HORMUZ_LAT_LON: tuple[float, float] = (26.6, 56.5)
 
+# Russia heatmap — scenario refinery kinetic sites (pulsing red DivIcons on tactical map)
+_RUSSIA_HEATMAP_SITES: tuple[tuple[str, float, float, str], ...] = (
+    ("Yaroslavl refinery cluster (YANOS area)", 57.626, 39.884, "Kinetic monitor — Yaroslavl."),
+    ("Samara — Promsintez (Novokuybyshevsk belt)", 53.10, 49.94, "Kinetic monitor — Promsintez."),
+    ("Ufa — Bashneft-Novoyl", 54.733, 55.967, "Latest kinetic strike — geolocated OSINT."),
+)
+
+
+def _russia_kinetic_site_popup_html(title: str, body_html_lines: tuple[str, ...]) -> str:
+    lines = "".join(body_html_lines)
+    return (
+        f'<div style="font-family:system-ui,ui-monospace,Menlo,monospace;">'
+        f'<h3 style="color:#ff4444;margin:0 0 10px 0;font-size:16px;">{html.escape(title)}</h3>'
+        f"{lines}</div>"
+    )
+
+
+def _add_russia_heatmap_kinetic_markers(m: folium.Map) -> None:
+    """Pulsing red markers — Russia OSINT kinetic layer (Yaroslavl, Samara, Ufa)."""
+    ufa_popup = _russia_kinetic_site_popup_html(
+        "Ufa — Bashneft-Novoyl",
+        (
+            '<p style="margin:4px 0;color:#ddd;font-size:13px;">Drone strike · <b>7.3 Mt/yr</b> nameplate. '
+            "Large-scale fire — Telegram footage geolocated (scenario: Apr 2, 2026).</p>",
+        ),
+    )
+    yar_popup = _russia_kinetic_site_popup_html(
+        "Yaroslavl",
+        (
+            '<p style="margin:4px 0;color:#ddd;font-size:13px;">Russia heatmap — refinery kinetic '
+            "monitoring (YANOS / Yaroslavl belt).</p>",
+        ),
+    )
+    sam_popup = _russia_kinetic_site_popup_html(
+        "Samara — Promsintez",
+        (
+            '<p style="margin:4px 0;color:#ddd;font-size:13px;">Russia heatmap — Promsintez / '
+            "Novokuybyshevsk cluster.</p>",
+        ),
+    )
+    popups = (yar_popup, sam_popup, ufa_popup)
+    for idx, (label, lat, lon, tip_line) in enumerate(_RUSSIA_HEATMAP_SITES):
+        html = (
+            '<div style="width:54px;height:54px;display:flex;align-items:center;'
+            'justify-content:center;">'
+            '<div class="warroom-russia-kinetic-pulse" style="'
+            "width:42px;height:42px;border-radius:50%;"
+            "background:rgba(255,0,0,0.5);border:3px solid #ff0000;"
+            '"></div></div>'
+        )
+        folium.Marker(
+            location=[lat, lon],
+            icon=folium.DivIcon(html=html, icon_size=(54, 54), icon_anchor=(27, 27)),
+            tooltip=folium.Tooltip(f"RUSSIA HEATMAP\n{label}\n{tip_line}", sticky=True),
+            popup=folium.Popup(popups[idx], max_width=320),
+        ).add_to(m)
+
 
 def _add_war_room_port_pin(m: folium.Map, pin: WarRoomPortPin) -> None:
     d_mag = pin.supply_drop_mag
@@ -907,8 +968,8 @@ def build_tactical_war_room_map(
     trade_drop_pct: dict[str, float] | None = None,
 ) -> folium.Map:
     """
-    Tactical overlay: closed-loop great-circle narrative routes (blocked Suez vs active Cape),
-    Malacca–Hormuz conflict branch, and port pins anchored to route endpoints (WAR_ROOM_PORT_PINS).
+    Tactical overlay: Suez/Cape network, Hormuz branch, trade hubs, and Russia heatmap
+    (pulsing refinery kinetic markers: Yaroslavl, Samara/Promsintez, Ufa).
     """
     m = folium.Map(
         location=[15.0, 45.0],
@@ -997,6 +1058,7 @@ def build_tactical_war_room_map(
         _add_war_room_port_pin(m, port_pin)
 
     _add_hormuz_conflict_marker(m)
+    _add_russia_heatmap_kinetic_markers(m)
 
     return m
 
@@ -1128,6 +1190,50 @@ def render_x33_industry_impact_table() -> None:
             "Status": st.column_config.TextColumn("Indicator", width="medium"),
         },
     )
+
+
+def render_ukraine_osint_kinetic_monitor() -> None:
+    """
+    Russia domestic kinetic/refinery OSINT panel (title reflects Ukraine-adjacent monitor lens).
+    """
+    st.subheader("Ukraine OSINT Kinetic Monitor")
+    with st.container(border=True):
+        st.markdown(
+            """
+            <style>
+              .ua-osint-block h4 {
+                color: #ff6666 !important;
+                font-size: 1.05rem !important;
+                letter-spacing: 0.12em;
+                margin: 14px 0 8px 0;
+                font-weight: 900;
+              }
+              .ua-osint-block p, .ua-osint-block li {
+                color: #eeeeee !important;
+                font-size: 1.05rem !important;
+                line-height: 1.5 !important;
+              }
+              .ua-osint-block ul { margin: 6px 0 0 0; padding-left: 1.2rem; }
+            </style>
+            <div class="ua-osint-block">
+              <h4>REFINERY STRIKE TRACKER</h4>
+              <p><b>Latest event:</b> Drone strike on <b>Ufa Oil Refinery</b>
+              (Bashneft-Novoyl), Bashkortostan.</p>
+              <p><b>Impact:</b> <b>7.3M tonne/year</b> capacity. Large-scale fire confirmed
+              via geolocated Telegram footage (<b>April 2, 2026</b>).</p>
+              <h4>PORT INFRASTRUCTURE ALERT</h4>
+              <p><b>Status:</b> <b>Ust-Luga</b> and <b>Primorsk</b> (Baltic Sea) exports
+              <b>suspended</b>. Drone strikes have &quot;choked&quot; the pipeline system.</p>
+              <h4>EXPORT BAN TRIGGER</h4>
+              <p>Russia has officially suspended <b>all gasoline exports</b> as of
+              <b>April 1, 2026</b>, attributed to these domestic refinery losses.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "Russia heatmap on the tactical map: pulsing red markers at Yaroslavl, Samara (Promsintez), and Ufa."
+        )
 
 
 def render_global_oil_inventory_clock(now_utc: datetime) -> None:
@@ -1822,6 +1928,7 @@ def main() -> None:
     render_x33_global_inventory_deficit_gauge()
     render_global_oil_inventory_clock(now)
     render_x33_industry_impact_table()
+    render_ukraine_osint_kinetic_monitor()
 
     with st.sidebar:
         st.subheader("Market Watch")
@@ -1936,6 +2043,9 @@ def main() -> None:
         st.error("BLOCKADE DETECTED: Strait of Hormuz daily transits below 15.")
 
     st.subheader("War Room — Tactical Shipping Map")
+    st.caption(
+        "Includes **Russia heatmap** layer: pulsing red markers — Yaroslavl, Samara (Promsintez), Ufa."
+    )
     _dl = now - DEADLINE_UTC
     if _dl.total_seconds() > 0:
         _mins = int(_dl.total_seconds() // 60)
