@@ -967,49 +967,8 @@ def shipping_impact_table(now_utc: datetime) -> pd.DataFrame:
 
 
 def render_tactical_alert_banner(now_utc: datetime) -> None:
-    st.markdown(
-        f"""
-        <style>
-          @keyframes threatPulse {{
-            0%   {{ box-shadow: 0 0 0px rgba(255, 59, 59, 0.0); transform: scale(1.000); }}
-            50%  {{ box-shadow: 0 0 26px rgba(255, 59, 59, 0.45); transform: scale(1.005); }}
-            100% {{ box-shadow: 0 0 0px rgba(255, 59, 59, 0.0); transform: scale(1.000); }}
-          }}
-          .tacticalBanner {{
-            border: 2px solid #ff3b3b;
-            background: rgba(255, 0, 0, 0.16);
-            padding: 14px 16px;
-            border-radius: 12px;
-            margin-bottom: 12px;
-            animation: threatPulse 0.95s ease-in-out infinite;
-          }}
-          .tacticalTitle {{
-            font-size: 14px;
-            letter-spacing: 0.10em;
-            color: #ffd0d0;
-            font-weight: 900;
-          }}
-          .tacticalTimer {{
-            font-size: 42px;
-            line-height: 1.05;
-            color: #FFFF00;
-            font-weight: 1000;
-            margin-top: 6px;
-          }}
-          .tacticalSub {{
-            font-size: 14px;
-            color: #ffffff;
-            margin-top: 6px;
-            opacity: 0.92;
-          }}
-        </style>
-        <div class="tacticalBanner">
-          <div class="tacticalTitle">🚨 CRITICAL SECURITY THREAT: IRGC 8PM DEADLINE</div>
-          <div class="tacticalSub"><b>Intelligence Briefing:</b> The IRGC has designated 18 U.S. and Gulf technology firms as military targets. This shift from military to commercial infrastructure targets (Data Centers/AI Hubs) has triggered an immediate Force Majeure across the region.</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    # Banner removed per UI request.
+    return
 
 
 def _safe_float(x) -> float | None:
@@ -1506,8 +1465,6 @@ def main() -> None:
         '<div style="height:0.15rem" aria-hidden="true"></div>',
         unsafe_allow_html=True,
     )
-
-    render_tactical_alert_banner(now)
 
     with st.sidebar:
         st.subheader("Market Watch")
