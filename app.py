@@ -21,6 +21,7 @@ from branca.element import Element
 
 from logic import (
     RELIABILITY_BUFFER_DAYS,
+    DeepStateEnergyHit,
     apply_kinetic_hormuz_maximum_override,
     evaluate_strait_status_from_live_entries,
     fetch_live_google_news_multiquery,
@@ -28,6 +29,7 @@ from logic import (
     fetch_official_tehran_narrative,
     fetch_hormuz_stats,
     fetch_realtime_shipping_stats,
+    get_deepstate_updates,
 )
 
 
@@ -163,6 +165,11 @@ def _cached_tehran_narrative():
         api_key=_newsdata_api_key(),
         request_headers=NEWS_RSS_REQUEST_HEADERS,
     )
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_deepstate_energy_hits() -> list[DeepStateEnergyHit]:
+    return get_deepstate_updates(request_headers=NEWS_RSS_REQUEST_HEADERS)
 
 
 @st.cache_data(ttl=90, show_spinner=False)
@@ -1931,6 +1938,36 @@ def main() -> None:
     render_ukraine_osint_kinetic_monitor()
 
     with st.sidebar:
+        st.subheader("DEEPSTATE KINETIC FEED")
+        _ds_hits = _cached_deepstate_energy_hits()[:3]
+        if not _ds_hits:
+            st.caption(
+                "No posts matched oil-plant / strike keywords in the scraped window, "
+                "or DeepState preview fetch failed."
+            )
+        else:
+            for _i, _hit in enumerate(_ds_hits, start=1):
+                with st.container(border=True):
+                    st.caption(f"Energy hit #{_i} · {html.escape(_hit.matched_keyword)}")
+                    st.markdown(f"**{html.escape(_hit.kinetic_label)}**")
+                    st.markdown(html.escape(_hit.summary))
+                    if _hit.source_url:
+                        try:
+                            st.link_button(
+                                "Open in Telegram",
+                                _hit.source_url,
+                                use_container_width=True,
+                                key=f"deepstate_tg_{_i}",
+                            )
+                        except TypeError:
+                            uq = html.escape(_hit.source_url, quote=True)
+                            st.markdown(
+                                f'<a href="{uq}" target="_blank" rel="noopener noreferrer">'
+                                f"Open in Telegram</a>",
+                                unsafe_allow_html=True,
+                            )
+            st.markdown('<div style="height:0.75rem"></div>', unsafe_allow_html=True)
+
         st.subheader("Market Watch")
 
         mw = _cached_market_watch()

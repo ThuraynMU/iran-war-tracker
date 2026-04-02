@@ -2,6 +2,7 @@ streamlit
 pandas
 yfinance
 feedparser
+beautifulsoup4
 requests
 streamlit-autorefresh
 folium==0.20.0

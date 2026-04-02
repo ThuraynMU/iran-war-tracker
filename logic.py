@@ -11,6 +11,7 @@ from typing import Any
 
 import feedparser
 import requests
+from bs4 import BeautifulSoup
 from urllib.parse import quote_plus
 
 
@@ -1117,4 +1118,155 @@ def fetch_realtime_shipping_stats(
         reliability_buffer_days=RELIABILITY_BUFFER_DAYS,
         source=source,
     )
+
+
+# --- DeepState UA — Telegram web preview (t.me/s/…) energy-keyword monitor ---
+
+DEEPSTATE_UA_TELEGRAM_WEB = "https://t.me/s/DeepStateUA"
+
+# Oil depot / plant / incoming hit (strike arrival) — UA Cyrillic filters
+DEEPSTATE_ENERGY_KEYWORDS: tuple[str, ...] = (
+    "Нафтобаза",
+    "нафтобаза",
+    "Завод",
+    "завод",
+    "Приліт",
+    "приліт",
+)
+
+# Map substring hits to Kinetic Events-style labels (longer keys first)
+KINETIC_EVENT_CITY_ALIASES: tuple[tuple[str, str], ...] = (
+    ("Кривий Ріг", "Kryvyi Rih — kinetic sector"),
+    ("Запоріжжя", "Zaporizhzhia — kinetic sector"),
+    ("Миколаїв", "Mykolaiv — kinetic sector"),
+    ("Маріуполь", "Mariupol — kinetic sector"),
+    ("Покровськ", "Pokrovsk — kinetic sector"),
+    ("Краматорськ", "Kramatorsk — kinetic sector"),
+    ("Слов'янськ", "Sloviansk — kinetic sector"),
+    ("Словянськ", "Sloviansk — kinetic sector"),
+    ("Бахмут", "Bakhmut — kinetic sector"),
+    ("Часів Яр", "Chasiv Yar — kinetic sector"),
+    ("Куп'янськ", "Kupiansk — kinetic sector"),
+    ("Купянськ", "Kupiansk — kinetic sector"),
+    ("Харків", "Kharkiv — kinetic sector"),
+    ("Одеса", "Odesa — kinetic sector"),
+    ("Дніпро", "Dnipro — kinetic sector"),
+    ("Київ", "Kyiv — kinetic sector"),
+    ("Львів", "Lviv — kinetic sector"),
+    ("Суми", "Sumy — kinetic sector"),
+    ("Чернігів", "Chernihiv — kinetic sector"),
+    ("Полтава", "Poltava — kinetic sector"),
+    ("Рівне", "Rivne — kinetic sector"),
+    ("Вінниця", "Vinnytsia — kinetic sector"),
+)
+
+
+@dataclass(frozen=True)
+class DeepStateEnergyHit:
+    """Single DeepState post matching energy / kinetic keywords."""
+
+    summary: str
+    matched_keyword: str
+    latitude: float | None
+    longitude: float | None
+    kinetic_label: str
+    source_url: str | None
+
+
+def _deepstate_match_energy_keyword(text: str) -> str | None:
+    for kw in DEEPSTATE_ENERGY_KEYWORDS:
+        if kw in text:
+            return kw
+    return None
+
+
+def _deepstate_parse_coordinates(text: str) -> tuple[float, float] | None:
+    """Extract first plausible WGS84 pair in or near Ukraine."""
+    patterns = (
+        re.compile(r"(\d{2}\.\d{3,8})\s*[,;]\s*(\d{2}\.\d{3,8})"),
+        re.compile(r"(\d{2}\.\d{3,8})\s*/\s*(\d{2}\.\d{3,8})"),
+    )
+    for pat in patterns:
+        for m in pat.finditer(text):
+            try:
+                a, b = float(m.group(1)), float(m.group(2))
+            except ValueError:
+                continue
+            if 44.0 <= a <= 53.5 and 22.0 <= b <= 42.0:
+                return a, b
+            if 44.0 <= b <= 53.5 and 22.0 <= a <= 42.0:
+                return b, a
+    return None
+
+
+def _deepstate_kinetic_city_label(text: str) -> str:
+    for ua_fragment, label in KINETIC_EVENT_CITY_ALIASES:
+        if ua_fragment in text:
+            return label
+    return "Energy hit — location pending (see post)"
+
+
+def get_deepstate_updates(
+    *,
+    channel_web_url: str = DEEPSTATE_UA_TELEGRAM_WEB,
+    request_headers: dict[str, str] | None = None,
+    max_messages_scan: int = 100,
+    timeout_s: float = 28.0,
+) -> list[DeepStateEnergyHit]:
+    """
+    Scrape the public Telegram channel preview (HTML) for DeepState UA posts that mention
+    oil depots, plants/factories, or incoming strikes («Приліт»).
+
+    Coordinate pairs in the message (decimal °) are preferred; otherwise a city is mapped
+    to the kinetic-sector list when its Ukrainian name appears in the text.
+    """
+    headers = request_headers or dict(DEFAULT_RSS_REQUEST_HEADERS)
+    out: list[DeepStateEnergyHit] = []
+    try:
+        r = requests.get(channel_web_url, headers=headers, timeout=timeout_s)
+        r.raise_for_status()
+    except Exception:
+        return []
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    blocks = soup.select(".tgme_widget_message")[-max_messages_scan:]
+    # Telegram lists oldest → newest; process newest first
+    for block in reversed(blocks):
+        text_el = block.select_one(".tgme_widget_message_text")
+        if not text_el:
+            continue
+        text = text_el.get_text("\n", strip=True)
+        if not text:
+            continue
+        kw_hit = _deepstate_match_energy_keyword(text)
+        if not kw_hit:
+            continue
+
+        coords = _deepstate_parse_coordinates(text)
+        if coords:
+            lat, lon = coords
+            k_label = f"{lat:.4f}, {lon:.4f} (WGS84)"
+        else:
+            lat, lon = None, None
+            k_label = _deepstate_kinetic_city_label(text)
+
+        link_el = block.select_one("a.tgme_widget_message_date")
+        href = str(link_el.get("href")).strip() if link_el and link_el.get("href") else None
+
+        preview = text.replace("\n", " ").strip()
+        if len(preview) > 220:
+            preview = preview[:217] + "…"
+
+        out.append(
+            DeepStateEnergyHit(
+                summary=preview,
+                matched_keyword=kw_hit,
+                latitude=lat,
+                longitude=lon,
+                kinetic_label=k_label,
+                source_url=href,
+            )
+        )
+
+    return out
 
