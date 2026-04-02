@@ -53,13 +53,23 @@ NEWS_RSS_REQUEST_HEADERS: dict[str, str] = {
 
 DEADLINE_UTC = datetime(2026, 4, 1, 16, 30, tzinfo=UTC)  # 16:30 GMT == 20:00 Tehran
 
-# Global Oil Inventory Clock — scenario constants (M bbl/d)
+# Global Oil Inventory Clock — Hormuz closure anchor (calendar cumulative, separate from X33 window)
 HORMUZ_OIL_CLOSURE_START_DATE = date(2026, 3, 1)
-OIL_LOSS_HORMUZ_MBPD = -21.0
-OIL_LOSS_RUSSIA_DRONES_MBPD = -1.0
-OIL_REMED_KSA_YANBU_MBPD = 7.0  # East–West pipeline; max capacity reached Mar 28
-OIL_REMED_AD_HABSHAN_FUJAIRAH_MBPD = 0.0  # SHUT DOWN — Fujairah drone damage
-OIL_REMED_IRAQ_KR_TR_MBPD = 0.2  # Kurdistan–Turkey; resumed Mar 18
+
+# X33 Deficit Model (April 2, 2026 memo) — M bpd
+loss_hormuz = -21.0
+loss_russia = -1.0
+bypass_ksa = 7.0
+bypass_iraq = 0.2
+bypass_uae = 0.0
+X33_WINDOW_DAYS = 33
+
+# April 2 memo — sectoral % of marginal inventory impact (must sum to 100)
+X33_INDUSTRY_IMPACT_PCT: dict[str, float] = {
+    "Transport": 60.0,
+    "Industry": 28.0,
+    "Electricity": 12.0,
+}
 
 # Bar scale for cumulative depletion meter (M bbl); adjust if deficit run extends
 OIL_DEPLETION_METER_SCALE_MMBBL = 650.0
@@ -68,15 +78,32 @@ OIL_DEPLETION_METER_SCALE_MMBBL = 650.0
 GLOBAL_STRATEGIC_RESERVE_MMBBL = 1500.0
 
 
+def net_daily_deficit() -> float:
+    """X33 memo: losses + bypass capacity (M bpd)."""
+    return loss_hormuz + loss_russia + bypass_ksa + bypass_iraq + bypass_uae
+
+
+def accumulated_deficit_33d() -> float:
+    """X33: net daily deficit × 33 days (M bbl)."""
+    return net_daily_deficit() * float(X33_WINDOW_DAYS)
+
+
 def oil_net_daily_deficit_mbpd() -> float:
-    """Net balance (M bpd): Hormuz + Russia losses + remediation — same basis as Global Oil Inventory Clock."""
-    return (
-        OIL_LOSS_HORMUZ_MBPD
-        + OIL_LOSS_RUSSIA_DRONES_MBPD
-        + OIL_REMED_KSA_YANBU_MBPD
-        + OIL_REMED_AD_HABSHAN_FUJAIRAH_MBPD
-        + OIL_REMED_IRAQ_KR_TR_MBPD
-    )
+    """Alias for buffers / legacy call sites — same as X33 net daily deficit."""
+    return net_daily_deficit()
+
+
+def reuters_russia_1mbpd_article_url() -> str:
+    env = (os.environ.get("REUTERS_RUSSIA_1MBPD_URL") or "").strip()
+    if env:
+        return env
+    try:
+        u = str(st.secrets["REUTERS_RUSSIA_1MBPD_URL"]).strip()
+        if u:
+            return u
+    except Exception:
+        pass
+    return "https://www.reuters.com/business/energy/"
 
 
 # Secondary shock — Russia (Reuters Apr 2, 2026). Incremental cut *beyond* −1.0 M bpd headline:
@@ -1030,6 +1057,85 @@ def render_tactical_alert_banner(now_utc: datetime) -> None:
     return
 
 
+def render_x33_global_inventory_deficit_gauge() -> None:
+    """Hero metric: 33-day accumulated deficit (memo X33 model)."""
+    acc = accumulated_deficit_33d()
+    nd = net_daily_deficit()
+    abs_m = abs(acc)
+    st.markdown(
+        f"""
+        <div class="x33-deficit-gauge" style="
+          border:3px solid #ff0000;
+          border-radius:16px;
+          padding:22px 24px;
+          margin:0 0 16px 0;
+          background:linear-gradient(180deg,#320000 0%,#080000 100%);
+          box-shadow:0 0 36px rgba(255,0,0,0.5);
+          text-align:center;">
+          <div style="
+            font-size:0.82rem;
+            letter-spacing:0.2em;
+            color:#ffcccc;
+            font-weight:900;
+            margin-bottom:10px;">
+            GLOBAL INVENTORY DEFICIT (33 DAYS)</div>
+          <div style="
+            font-size:3.4rem;
+            font-weight:1000;
+            color:#ff0000;
+            line-height:1.0;
+            text-shadow:0 0 24px rgba(255,0,0,0.8);
+            font-variant-numeric:tabular-nums;">
+            {abs_m:.1f}M</div>
+          <div style="
+            font-size:1.35rem;
+            color:#ff6666;
+            font-weight:800;
+            letter-spacing:0.06em;">
+            BARRELS</div>
+          <div style="font-size:0.92rem;color:#b0b0b0;margin-top:12px;line-height:1.45;">
+            X33 model: net daily deficit <b style="color:#fff;">{nd:+.1f} M bpd</b>
+            × <b style="color:#fff;">{X33_WINDOW_DAYS}</b> days
+            = <b style="color:#ff5555;">{acc:+.1f} M bbl</b>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_reuters_russia_exclusive_subheader() -> None:
+    url = html.escape(reuters_russia_1mbpd_article_url(), quote=True)
+    st.markdown(
+        f"""
+        <h3 style="margin:0 0 14px 0;font-size:1.2rem;font-weight:900;letter-spacing:0.06em;">
+          <a href="{url}" target="_blank" rel="noopener noreferrer"
+             style="color:#ff3d00;text-decoration:underline;text-underline-offset:4px;">
+            REUTERS EXCLUSIVE: 1M BPD RUSSIAN CUTS CONFIRMED
+          </a>
+        </h3>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_x33_industry_impact_table() -> None:
+    rows = [
+        {"Sector": s, "Share of impact (%)": round(p, 1)}
+        for s, p in (
+            ("Transport", X33_INDUSTRY_IMPACT_PCT["Transport"]),
+            ("Industry", X33_INDUSTRY_IMPACT_PCT["Industry"]),
+            ("Electricity", X33_INDUSTRY_IMPACT_PCT["Electricity"]),
+        )
+    ]
+    total = sum(X33_INDUSTRY_IMPACT_PCT.values())
+    rows.append({"Sector": "Total", "Share of impact (%)": round(total, 1)})
+    df = pd.DataFrame(rows)
+    st.subheader("Industry impact — memo allocation")
+    st.caption("April 2, 2026 X33 memo: % breakdown for Transport, Industry, and Electricity.")
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+
 def render_global_oil_inventory_clock(now_utc: datetime) -> None:
     """
     Top-of-dashboard synthetic oil balance: supply shock vs bypass/remediation,
@@ -1038,20 +1144,17 @@ def render_global_oil_inventory_clock(now_utc: datetime) -> None:
     today = now_utc.date()
     days_since = max(0, (today - HORMUZ_OIL_CLOSURE_START_DATE).days)
 
-    supply_loss = OIL_LOSS_HORMUZ_MBPD + OIL_LOSS_RUSSIA_DRONES_MBPD
-    remediation_total = (
-        OIL_REMED_KSA_YANBU_MBPD
-        + OIL_REMED_AD_HABSHAN_FUJAIRAH_MBPD
-        + OIL_REMED_IRAQ_KR_TR_MBPD
-    )
-    net_daily_mbpd = oil_net_daily_deficit_mbpd()
+    supply_loss = loss_hormuz + loss_russia
+    remediation_total = bypass_ksa + bypass_uae + bypass_iraq
+    net_daily_mbpd = net_daily_deficit()
+    acc33 = accumulated_deficit_33d()
     buffer_days: float | None = None
     if net_daily_mbpd < -1e-9:
         buffer_days = GLOBAL_STRATEGIC_RESERVE_MMBBL / abs(net_daily_mbpd)
     total_depletion_mmbbl = net_daily_mbpd * float(days_since)
     fill_pct = min(
         100.0,
-        max(0.0, abs(total_depletion_mmbbl) / OIL_DEPLETION_METER_SCALE_MMBBL * 100.0),
+        max(0.0, abs(acc33) / OIL_DEPLETION_METER_SCALE_MMBBL * 100.0),
     )
 
     _d0 = HORMUZ_OIL_CLOSURE_START_DATE.strftime("%Y-%m-%d")
@@ -1178,25 +1281,25 @@ def render_global_oil_inventory_clock(now_utc: datetime) -> None:
           }}
         </style>
         <div class="global-oil-clock">
-          <h2>🛢 GLOBAL OIL INVENTORY CLOCK</h2>
+          <h2>🛢 GLOBAL OIL INVENTORY CLOCK (X33 VARIABLES)</h2>
           <div class="oil-row">
             <b>Daily supply loss:</b>
-            {OIL_LOSS_HORMUZ_MBPD:+.1f} M bpd (Hormuz) ·
-            {OIL_LOSS_RUSSIA_DRONES_MBPD:+.1f} M bpd (Russia drone strikes)
+            {loss_hormuz:+.1f} M bpd (Hormuz) ·
+            {loss_russia:+.1f} M bpd (Russia)
             &nbsp;→&nbsp;<b>{supply_loss:+.1f} M bpd</b>
           </div>
           <div class="oil-row" style="margin-top:10px;"><b>Daily remediation (bypass)</b></div>
           <div class="oil-sub">
-            • KSA East–West Pipeline (Yanbu): <b>+{OIL_REMED_KSA_YANBU_MBPD:.1f} M bpd</b>
+            • KSA East–West Pipeline (Yanbu): <b>+{bypass_ksa:.1f} M bpd</b>
             — max capacity reached Mar 28.
           </div>
           <div class="oil-sub">
-            • Abu Dhabi (Habshan–Fujairah): <b>+{OIL_REMED_AD_HABSHAN_FUJAIRAH_MBPD:.1f} M bpd</b>
+            • UAE (Habshan–Fujairah): <b>+{bypass_uae:.1f} M bpd</b>
             — <span style="color:#ff6666;">STATUS: SHUT DOWN</span>
             (drone damage at Fujairah terminal).
           </div>
           <div class="oil-sub">
-            • Iraq (Kurdistan–Turkey): <b>+{OIL_REMED_IRAQ_KR_TR_MBPD:.1f} M bpd</b>
+            • Iraq (Kurdistan–Turkey): <b>+{bypass_iraq:.1f} M bpd</b>
             — resumed Mar 18.
           </div>
           <div class="oil-net">
@@ -1208,15 +1311,19 @@ def render_global_oil_inventory_clock(now_utc: datetime) -> None:
             {_buffer_runway_inner_html}
           </div>
           <div class="oil-x33">
-            <b>X33 accumulator:</b> ({net_daily_mbpd:+.1f} M bpd) × <b>{days_since}</b> day(s)
-            since Hormuz closure ({html.escape(_d0)}) &nbsp;·&nbsp; as-of {html.escape(_today_s)} UTC date
-            &nbsp;→&nbsp;<b style="color:#ff5555;">{total_depletion_mmbbl:+.1f} M bbl</b> cumulative.
+            <b>X33 accumulated deficit (33 days):</b>
+            ({net_daily_mbpd:+.1f} M bpd × {X33_WINDOW_DAYS} d)
+            &nbsp;→&nbsp;<b style="color:#ff5555;">{acc33:+.1f} M bbl</b>
           </div>
-          <div class="oil-meter-wrap" title="Total inventory depletion (cumulative, scenario)">
+          <div class="oil-x33" style="opacity:0.88;font-size:0.98rem;">
+            <b>Calendar cumulative</b> since Hormuz closure ({html.escape(_d0)}): {total_depletion_mmbbl:+.1f} M bbl
+            ({net_daily_mbpd:+.1f} M bpd × {days_since} d) · as-of {html.escape(_today_s)}
+          </div>
+          <div class="oil-meter-wrap" title="X33 33-day deficit magnitude vs scale">
             <div class="oil-meter-fill"></div>
           </div>
-          <div class="oil-meter-label">Total inventory depletion: {total_depletion_mmbbl:+.1f} M bbl</div>
-          <div class="oil-meter-cap">Meter scale: 0–{OIL_DEPLETION_METER_SCALE_MMBBL:.0f} M bbl (bright red = cumulative draw severity).</div>
+          <div class="oil-meter-label">X33 | 33-day inventory deficit: {acc33:+.1f} M bbl</div>
+          <div class="oil-meter-cap">Meter scale: 0–{OIL_DEPLETION_METER_SCALE_MMBBL:.0f} M bbl (vs. |accumulated_deficit_33d|).</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1272,7 +1379,7 @@ def render_secondary_shock_russian_output_card() -> None:
           <h3>SECONDARY SHOCK: RUSSIAN OUTPUT</h3>
           <div class="rs-line"><b>Source:</b> Reuters ({html.escape(_src)}).</div>
           <div class="rs-line rs-status">
-            Status: {OIL_LOSS_RUSSIA_DRONES_MBPD:+.1f} M bpd output cut — &quot;unavoidable&quot; drone strikes
+            Status: {loss_russia:+.1f} M bpd output cut — &quot;unavoidable&quot; drone strikes
             on export infrastructure.
           </div>
           <div class="rs-discerner">
@@ -1764,7 +1871,10 @@ def main() -> None:
             unsafe_allow_html=True,
         )
 
+    render_x33_global_inventory_deficit_gauge()
+    render_reuters_russia_exclusive_subheader()
     render_global_oil_inventory_clock(now)
+    render_x33_industry_impact_table()
     render_secondary_shock_russian_output_card()
 
     render_osint_kinetic_marquee(tactical_osint_rows)
