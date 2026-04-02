@@ -100,22 +100,7 @@ def oil_net_daily_deficit_mbpd() -> float:
     return net_daily_deficit()
 
 
-def reuters_russia_1mbpd_article_url() -> str:
-    env = (os.environ.get("REUTERS_RUSSIA_1MBPD_URL") or "").strip()
-    if env:
-        return env
-    try:
-        u = str(st.secrets["REUTERS_RUSSIA_1MBPD_URL"]).strip()
-        if u:
-            return u
-    except Exception:
-        pass
-    return "https://www.reuters.com/business/energy/"
-
-
-# Secondary shock — Russia (Reuters Apr 2, 2026). Incremental cut *beyond* −1.0 M bpd headline:
-# Discerner adds this many points to Global Panic Score when extra cut ≥ threshold.
-RUSSIA_SECONDARY_SHOCK_REUTERS_DATE = date(2026, 4, 2)
+# Russian secondary-shock Discerner (incremental cut beyond headline −1.0 mio bpd scenario):
 RUSSIA_DISCERNER_EXTRA_CUT_THRESHOLD_MBPD = 0.5
 RUSSIA_DISCERNER_GLOBAL_PANIC_BUMP = 10
 # Scenario knob: set ≥0.5 to simulate “another 500k” and show +10 on the gauge.
@@ -188,6 +173,9 @@ def _cached_live_entries() -> list[dict]:
         "(Hormuz OR 'Red Sea' OR Strait) AND (shipping OR tanker OR Iran OR IRGC OR strike)",
         "(Israel OR 'United States' OR Pentagon) AND (Iran OR IRGC OR war OR military OR Gulf)",
         "Iran OR IRGC OR Hormuz OR 'Strait of Hormuz' when:6h",
+        "(Russia OR Russian OR Urals OR Rosneft OR Novatek OR Lukoil) AND "
+        "(oil OR crude OR export OR production OR output OR refinery OR OPEC+ OR sanction OR drone OR port)",
+        "(Russian oil OR Russia crude OR Urals export OR Black Sea oil) when:1d",
     ]
     return fetch_live_google_news_multiquery(
         queries,
@@ -206,6 +194,12 @@ BGRI_FLASHPOINT_KEYWORDS: tuple[str, ...] = (
     "Blockade",
     "Insurance",
     "Ultimatum",
+    "Russia",
+    "Russian",
+    "Urals",
+    "Rosneft",
+    "Lukoil",
+    "Novatek",
 )
 BGRI_BASELINE_HITS = 5.0  # simulated 30-day average hit counts
 
@@ -1112,25 +1106,6 @@ def render_x33_global_inventory_deficit_gauge() -> None:
     )
 
 
-def render_reuters_russian_output_link_button() -> None:
-    url = reuters_russia_1mbpd_article_url()
-    try:
-        st.link_button(
-            "REUTERS: Russian Output Cuts Unavoidable",
-            url=url,
-            type="primary",
-            use_container_width=True,
-        )
-    except Exception:
-        u_esc = html.escape(url, quote=True)
-        st.markdown(
-            f'<a href="{u_esc}" target="_blank" rel="noopener noreferrer">'
-            f"<button style=\"padding:12px 18px;font-size:1.1rem;width:100%;cursor:pointer;\">"
-            f"REUTERS: Russian Output Cuts Unavoidable</button></a>",
-            unsafe_allow_html=True,
-        )
-
-
 def render_x33_industry_impact_table() -> None:
     rows = []
     status_emoji = {"Critical": "🔴", "High": "🟠", "Moderate": "🟡"}
@@ -1342,69 +1317,6 @@ def render_global_oil_inventory_clock(now_utc: datetime) -> None:
           </div>
           <div class="oil-meter-label">X33 | 33-day inventory deficit: {acc33:+.1f} M bbl</div>
           <div class="oil-meter-cap">Meter scale: 0–{OIL_DEPLETION_METER_SCALE_MMBBL:.0f} M bbl (vs. |accumulated_33d|).</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def render_secondary_shock_russian_output_card() -> None:
-    """Reuters-sourced Russian export shock; Discerner rule for Global Panic Score."""
-    mo = RUSSIA_SECONDARY_SHOCK_REUTERS_DATE.strftime("%B")
-    d = RUSSIA_SECONDARY_SHOCK_REUTERS_DATE.day
-    y = RUSSIA_SECONDARY_SHOCK_REUTERS_DATE.year
-    _src = f"{mo} {d}, {y}"
-    st.markdown(
-        f"""
-        <style>
-          .russia-secondary-card {{
-            border: 2px solid #8b7355;
-            border-radius: 14px;
-            background: linear-gradient(165deg, rgba(35,28,20,0.92) 0%, rgba(12,10,8,0.96) 100%);
-            padding: 16px 18px 18px 18px;
-            margin: 0 0 14px 0;
-            box-shadow: 0 0 18px rgba(200, 160, 90, 0.18);
-          }}
-          .russia-secondary-card h3 {{
-            margin: 0 0 8px 0;
-            font-size: 1.12rem;
-            letter-spacing: 0.11em;
-            color: #f5e6c8;
-            font-weight: 900;
-          }}
-          .russia-secondary-card .rs-line {{
-            font-size: 1.05rem;
-            color: #eee;
-            margin: 6px 0;
-            line-height: 1.5;
-          }}
-          .russia-secondary-card .rs-discerner {{
-            margin-top: 12px;
-            padding: 10px 12px;
-            border-left: 4px solid #ff9800;
-            background: rgba(255, 152, 0, 0.08);
-            font-size: 1.02rem;
-            color: #ffe0b2;
-            line-height: 1.45;
-          }}
-          .russia-secondary-card .rs-status {{
-            color: #ffab91;
-            font-weight: 800;
-            font-size: 1.08rem;
-          }}
-        </style>
-        <div class="russia-secondary-card">
-          <h3>SECONDARY SHOCK: RUSSIAN OUTPUT</h3>
-          <div class="rs-line"><b>Source:</b> Reuters ({html.escape(_src)}).</div>
-          <div class="rs-line rs-status">
-            Status: {loss_russia:+.1f} M bpd output cut — &quot;unavoidable&quot; drone strikes
-            on export infrastructure.
-          </div>
-          <div class="rs-discerner">
-            <b>Discerner logic:</b> If Russia&apos;s output drops another
-            {RUSSIA_DISCERNER_EXTRA_CUT_THRESHOLD_MBPD:.1f} M bpd, increase the
-            <b>Global Panic Score</b> by <b>{RUSSIA_DISCERNER_GLOBAL_PANIC_BUMP}</b> points.
-          </div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1749,6 +1661,24 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
+    # First on the page: kinetic marquee, then manual refresh (per tablet spacing)
+    render_osint_kinetic_marquee(tactical_osint_rows)
+
+    _top_pad, _top_refresh = st.columns([7, 1], gap="small")
+    with _top_refresh:
+        if st.button(
+            "🔄 Manual Refresh",
+            use_container_width=True,
+            key="manual_refresh_top_right",
+            help="Clear cached RSS, news, and market data and rerun",
+        ):
+            st.cache_data.clear()
+            st.rerun()
+    st.markdown(
+        '<div style="height:0.15rem" aria-hidden="true"></div>',
+        unsafe_allow_html=True,
+    )
+
     st.markdown(
         """
         <style>
@@ -1890,27 +1820,8 @@ def main() -> None:
         )
 
     render_x33_global_inventory_deficit_gauge()
-    render_reuters_russian_output_link_button()
     render_global_oil_inventory_clock(now)
     render_x33_industry_impact_table()
-    render_secondary_shock_russian_output_card()
-
-    render_osint_kinetic_marquee(tactical_osint_rows)
-
-    _top_pad, _top_refresh = st.columns([7, 1], gap="small")
-    with _top_refresh:
-        if st.button(
-            "🔄 Manual Refresh",
-            use_container_width=True,
-            key="manual_refresh_top_right",
-            help="Clear cached RSS, news, and market data and rerun",
-        ):
-            st.cache_data.clear()
-            st.rerun()
-    st.markdown(
-        '<div style="height:0.15rem" aria-hidden="true"></div>',
-        unsafe_allow_html=True,
-    )
 
     with st.sidebar:
         st.subheader("Market Watch")
