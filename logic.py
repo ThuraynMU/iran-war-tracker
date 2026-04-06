@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from calendar import timegm
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 import html
 import math
 import re
-from typing import Any
+from typing import Any, Sequence
 
 import feedparser
 import requests
@@ -1409,4 +1409,235 @@ def get_deepstate_updates(
         )
 
     return out
+
+
+# --- Shadow fleet intelligence (Baltic / AIS–STS heuristics; wire to live AIS when available) ---
+
+DEFAULT_RUSSIAN_TANKER_LIST: frozenset[str] = frozenset(
+    {
+        "IMO9783431",
+        "IMO9454567",
+        "IMO9881234",
+        "IMO9732108",
+        "RU-TNK-SHADOW-01",
+    }
+)
+
+GOTLAND_TRANSFER_ZONE_LAT_MIN = 57.0
+GOTLAND_TRANSFER_ZONE_LON_MIN = 18.0
+GOTLAND_TRANSFER_ZONE_LAT_MAX = 59.0
+GOTLAND_TRANSFER_ZONE_LON_MAX = 20.0
+
+
+@dataclass(frozen=True)
+class ShadowVesselState:
+    """One vessel snapshot for the rules engine."""
+
+    vessel_id: str
+    name: str
+    position_updated_at: datetime | None
+    latitude: float | None
+    longitude: float | None
+    current_draft_m: float | None
+    previous_draft_m: float | None
+    inside_port: bool
+    path_start_lat: float | None
+    path_start_lon: float | None
+    path_end_lat: float | None
+    path_end_lon: float | None
+    segment_had_port_call: bool
+    on_russian_tanker_list: bool
+
+
+@dataclass(frozen=True)
+class ShadowVesselAssessment:
+    """Outputs for map styling, tooltips, and sidebar."""
+
+    vessel_id: str
+    name: str
+    latitude: float
+    longitude: float
+    gray_ghost: bool
+    probable_sts: bool
+    cargo_discharge_alert: bool
+    reasons: tuple[str, ...]
+
+
+class ShadowFleetIntelligence:
+    """
+    - Gray Ghost: Russian-listed tanker with no AIS position for > ``ais_stale_hours`` (default 4).
+    - Probable STS: track starts or ends inside Gotland box without a port call on segment.
+    - Cargo discharge alert: draft drops > ``draft_drop_alert_m`` outside a port.
+    """
+
+    ais_stale_hours: float = 4.0
+    draft_drop_alert_m: float = 2.0
+
+    def __init__(
+        self,
+        *,
+        russian_tanker_list: frozenset[str] | None = None,
+        ais_stale_hours: float | None = None,
+        draft_drop_alert_m: float | None = None,
+    ) -> None:
+        self._russian_list = (
+            russian_tanker_list if russian_tanker_list is not None else DEFAULT_RUSSIAN_TANKER_LIST
+        )
+        if ais_stale_hours is not None:
+            self.ais_stale_hours = float(ais_stale_hours)
+        if draft_drop_alert_m is not None:
+            self.draft_drop_alert_m = float(draft_drop_alert_m)
+
+    @staticmethod
+    def gotland_transfer_zone_contains(lat: float, lon: float) -> bool:
+        """Gotland transfer zone bounding box [57.0,18.0] → [59.0,20.0]."""
+        return (
+            GOTLAND_TRANSFER_ZONE_LAT_MIN <= lat <= GOTLAND_TRANSFER_ZONE_LAT_MAX
+            and GOTLAND_TRANSFER_ZONE_LON_MIN <= lon <= GOTLAND_TRANSFER_ZONE_LON_MAX
+        )
+
+    def is_listed_russian_tanker(self, vessel_id: str) -> bool:
+        vid = (vessel_id or "").strip().upper()
+        return vid in {x.strip().upper() for x in self._russian_list}
+
+    def _gray_ghost(self, state: ShadowVesselState, *, now: datetime) -> bool:
+        if not state.on_russian_tanker_list:
+            return False
+        if state.position_updated_at is None:
+            return True
+        pu = state.position_updated_at
+        if pu.tzinfo is None:
+            pu = pu.replace(tzinfo=UTC)
+        age_h = (now.astimezone(UTC) - pu.astimezone(UTC)).total_seconds() / 3600.0
+        return age_h > self.ais_stale_hours
+
+    def _probable_sts(self, state: ShadowVesselState) -> bool:
+        if state.segment_had_port_call:
+            return False
+        inside_start = inside_end = False
+        if state.path_start_lat is not None and state.path_start_lon is not None:
+            inside_start = self.gotland_transfer_zone_contains(state.path_start_lat, state.path_start_lon)
+        if state.path_end_lat is not None and state.path_end_lon is not None:
+            inside_end = self.gotland_transfer_zone_contains(state.path_end_lat, state.path_end_lon)
+        return inside_start or inside_end
+
+    def _cargo_discharge_alert(self, state: ShadowVesselState) -> bool:
+        if state.inside_port:
+            return False
+        if state.previous_draft_m is None or state.current_draft_m is None:
+            return False
+        return (float(state.previous_draft_m) - float(state.current_draft_m)) > self.draft_drop_alert_m
+
+    def assess(self, state: ShadowVesselState, *, now: datetime | None = None) -> ShadowVesselAssessment:
+        now_utc = now if now is not None else datetime.now(UTC)
+        if now_utc.tzinfo is None:
+            now_utc = now_utc.replace(tzinfo=UTC)
+
+        gg = self._gray_ghost(state, now=now_utc)
+        sts = self._probable_sts(state)
+        discharge = self._cargo_discharge_alert(state)
+
+        reasons: list[str] = []
+        if gg:
+            reasons.append(
+                f"Gray Ghost: Russian-listed tanker AIS silent >{self.ais_stale_hours:.0f}h or no fix"
+            )
+        if sts:
+            reasons.append(
+                "Probable STS: segment start/end inside Gotland transfer zone without port call"
+            )
+        if discharge:
+            reasons.append(
+                f"Cargo discharge alert: draft −Δ>{self.draft_drop_alert_m:g} m outside port"
+            )
+
+        lat = float(state.latitude) if state.latitude is not None else 57.8
+        lon = float(state.longitude) if state.longitude is not None else 19.2
+
+        return ShadowVesselAssessment(
+            vessel_id=state.vessel_id,
+            name=state.name,
+            latitude=lat,
+            longitude=lon,
+            gray_ghost=gg,
+            probable_sts=sts,
+            cargo_discharge_alert=discharge,
+            reasons=tuple(reasons),
+        )
+
+    @staticmethod
+    def fleet_confidence_percent(assessments: Sequence[ShadowVesselAssessment]) -> int:
+        """
+        0–100%: equal weight to Gray Ghost rate, Probable STS rate, discharge-alert rate.
+        """
+        if not assessments:
+            return 0
+        n = float(len(assessments))
+        ghost_rate = sum(1 for a in assessments if a.gray_ghost) / n
+        sts_rate = sum(1 for a in assessments if a.probable_sts) / n
+        discharge_rate = sum(1 for a in assessments if a.cargo_discharge_alert) / n
+        raw = 100.0 * (ghost_rate + sts_rate + discharge_rate) / 3.0
+        return int(max(0, min(100, round(raw))))
+
+
+def demo_shadow_fleet_assessments(*, now: datetime | None = None) -> list[ShadowVesselAssessment]:
+    """Synthetic fleet rows for dashboard wiring until AIS ingestion exists."""
+    now_utc = now if now is not None else datetime.now(UTC)
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=UTC)
+    intel = ShadowFleetIntelligence()
+    stale = now_utc - timedelta(hours=5)
+
+    states: list[ShadowVesselState] = [
+        ShadowVesselState(
+            vessel_id="IMO9783431",
+            name="NORDIC RELIANCE (demo)",
+            position_updated_at=stale,
+            latitude=57.9,
+            longitude=19.1,
+            current_draft_m=10.5,
+            previous_draft_m=10.4,
+            inside_port=False,
+            path_start_lat=59.2,
+            path_start_lon=21.0,
+            path_end_lat=57.9,
+            path_end_lon=19.1,
+            segment_had_port_call=False,
+            on_russian_tanker_list=True,
+        ),
+        ShadowVesselState(
+            vessel_id="IMO9454567",
+            name="BALTIC FRONTIER (demo)",
+            position_updated_at=now_utc,
+            latitude=58.2,
+            longitude=18.6,
+            current_draft_m=8.0,
+            previous_draft_m=11.2,
+            inside_port=False,
+            path_start_lat=58.2,
+            path_start_lon=18.6,
+            path_end_lat=58.2,
+            path_end_lon=18.6,
+            segment_had_port_call=False,
+            on_russian_tanker_list=True,
+        ),
+        ShadowVesselState(
+            vessel_id="IMO9881234",
+            name="SAFE LEGAL TANKER (demo)",
+            position_updated_at=now_utc,
+            latitude=55.0,
+            longitude=12.0,
+            current_draft_m=12.0,
+            previous_draft_m=12.1,
+            inside_port=False,
+            path_start_lat=55.0,
+            path_start_lon=12.0,
+            path_end_lat=55.1,
+            path_end_lon=12.1,
+            segment_had_port_call=True,
+            on_russian_tanker_list=False,
+        ),
+    ]
+
+    return [intel.assess(s, now=now_utc) for s in states]
 

@@ -20,10 +20,17 @@ import time
 from branca.element import Element
 
 from logic import (
+    GOTLAND_TRANSFER_ZONE_LAT_MAX,
+    GOTLAND_TRANSFER_ZONE_LAT_MIN,
+    GOTLAND_TRANSFER_ZONE_LON_MAX,
+    GOTLAND_TRANSFER_ZONE_LON_MIN,
     RELIABILITY_BUFFER_DAYS,
     DeepStateEnergyHit,
+    ShadowFleetIntelligence,
+    ShadowVesselAssessment,
     UkraineOilInfraScrapeRow,
     apply_kinetic_hormuz_maximum_override,
+    demo_shadow_fleet_assessments,
     evaluate_strait_status_from_live_entries,
     fetch_live_google_news_multiquery,
     fetch_liveuamap_mideast_kinetic,
@@ -164,6 +171,11 @@ def _cached_liveuamap_bundle():
 @st.cache_data(ttl=120, show_spinner=False)
 def _cached_ukraine_liveuamap_oil_infra_rows() -> list[UkraineOilInfraScrapeRow]:
     return fetch_ukraine_liveuamap_oil_infra_rows(request_headers=NEWS_RSS_REQUEST_HEADERS)
+
+
+@st.cache_data(ttl=90, show_spinner=False)
+def _cached_shadow_fleet_assessments() -> list[ShadowVesselAssessment]:
+    return demo_shadow_fleet_assessments(now=datetime.now(UTC))
 
 
 @st.cache_data(ttl=90, show_spinner=False)
@@ -746,6 +758,30 @@ def _war_room_leaflet_contrast_css() -> str:
         .warroom-hormuz-pulse-inner {
           animation: warroomPulse 1.15s ease-in-out infinite;
         }
+        @keyframes warroomGotlandPulse {
+          0%, 100% { transform: scale(1); opacity: 0.9; }
+          50% { transform: scale(1.22); opacity: 0.4; }
+        }
+        .warroom-gotland-pulse {
+          animation: warroomGotlandPulse 1.05s ease-in-out infinite;
+          box-shadow: 0 0 26px rgba(255, 152, 0, 0.92);
+        }
+        @keyframes warroomGrayGhostPulse {
+          0%, 100% { transform: scale(1); opacity: 0.85; }
+          50% { transform: scale(1.18); opacity: 0.38; }
+        }
+        .warroom-gray-ghost-pulse {
+          animation: warroomGrayGhostPulse 1.35s ease-in-out infinite;
+          box-shadow: 0 0 20px rgba(189, 189, 189, 0.9);
+        }
+        @keyframes warroomStsVioletPulse {
+          0%, 100% { transform: scale(1); opacity: 0.88; }
+          50% { transform: scale(1.14); opacity: 0.45; }
+        }
+        .warroom-sts-pulse {
+          animation: warroomStsVioletPulse 1.1s ease-in-out infinite;
+          box-shadow: 0 0 22px rgba(156, 39, 176, 0.88);
+        }
         </style>
         """
 
@@ -800,6 +836,227 @@ class WarRoomPortPin:
     supply_drop_mag: float
     status: str
     critical_blink: bool = False
+
+
+@dataclass(frozen=True)
+class ShadowFleetSnapshot:
+    """Synthetic AIS-gap + refinery–port corridor readout (no live AIS API in-stack)."""
+
+    ais_gap_alert_hours: float
+    ufa_throughput_loss_kbpd: float
+    primorsk_dispatch_delta_tankers_per_week: float
+    vessel_ghosting_active_count: int
+    shadow_transfer_in_progress: bool
+    spill_probability_0_100: int
+    watch_zones: tuple[str, ...]
+
+
+# Baltic export anchors + Gotland-gap overlay (scenario monitor).
+SHADOW_FLEET_UST_LUGA: tuple[float, float] = (59.68, 28.43)
+SHADOW_FLEET_PRIMORSK: tuple[float, float] = (60.35, 28.65)
+# East of Gotland — STS / dark-fleet correlation zone (map circle centre).
+WAR_ROOM_GOTLAND_GAP_CENTER_LL: tuple[float, float] = (57.72, 19.45)
+WAR_ROOM_GOTLAND_GAP_RADIUS_M: int = 72_000
+WAR_ROOM_GOTLAND_GAP_TOOLTIP: str = (
+    "STS Transfer Hub: High activity detected after April 3rd detention of Flora 1"
+)
+# Ufa (Bashneft-Novoyl) scenario loss → Primorsk liftings (module rule).
+SHADOW_FLEET_UFA_LOSS_KBPD = 150.0
+SHADOW_FLEET_KBPD_PER_TANKER_WEEK_PRIMORSK = 150.0
+SHADOW_FLEET_AIS_SILENCE_ALERT_H = 4.0
+
+
+def _compute_shadow_fleet_snapshot(now_utc: datetime) -> ShadowFleetSnapshot:
+    """
+    Vessel ghosting heuristic: departures Ust-Luga / Primorsk + AIS drop >4h inside
+    Gotland / Danish Straits watch boxes ⇒ count toward shadow-transfer posture.
+    Values are scenario-weighted (AIS feeds not wired); counts nudge with deadline window.
+    """
+    zones = ("Gotland east", "Danish Straits (Great Belt–Skagen)")
+    ufa_loss = float(SHADOW_FLEET_UFA_LOSS_KBPD)
+    tpw = ufa_loss / float(SHADOW_FLEET_KBPD_PER_TANKER_WEEK_PRIMORSK)
+    # Synthetic watchlist count: base 1 + extra watch during high-alert window
+    window_bump = 1 if deadline_window_active(now_utc) else 0
+    ghosting = 2 + window_bump
+    shadow = ghosting >= 2
+    # Spill probability: older uninsured shadow hulls + Flora 1 precedent → elevated Baltic "war tax"
+    spill = min(100, 58 + ghosting * 7 + (10 if shadow else 0))
+    return ShadowFleetSnapshot(
+        ais_gap_alert_hours=float(SHADOW_FLEET_AIS_SILENCE_ALERT_H),
+        ufa_throughput_loss_kbpd=ufa_loss,
+        primorsk_dispatch_delta_tankers_per_week=-round(tpw, 2),
+        vessel_ghosting_active_count=ghosting,
+        shadow_transfer_in_progress=shadow,
+        spill_probability_0_100=spill,
+        watch_zones=zones,
+    )
+
+
+def render_shadow_fleet_detection_panel(now_utc: datetime) -> None:
+    """Baltic / North Sea shadow-fleet monitor: AIS-gap logic, Ufa→Primorsk, spill gauge."""
+    snap = _compute_shadow_fleet_snapshot(now_utc)
+    st.subheader("Shadow Fleet Detection — Baltic & North Sea")
+    st.caption(
+        "Rule-based monitor (synthetic AIS gaps): tankers sailings from **Ust-Luga** or **Primorsk** "
+        f"losing AIS for **>{snap.ais_gap_alert_hours:.0f} h** in **{', '.join(snap.watch_zones)}** "
+        "is classified as **Shadow transfer in progress**."
+    )
+    m1, m2, m3 = st.columns(3)
+    with m1:
+        st.metric(
+            "Vessel ghosting (active tracks)",
+            snap.vessel_ghosting_active_count,
+            delta="STS / dark-fleet watch",
+            delta_color="off",
+        )
+    with m2:
+        st.metric(
+            "Shadow transfer posture",
+            "ACTIVE" if snap.shadow_transfer_in_progress else "WATCH",
+            delta="AIS gap + Baltic box",
+            delta_color="inverse" if snap.shadow_transfer_in_progress else "off",
+        )
+    with m3:
+        st.metric(
+            "Ufa → Primorsk upstream pressure",
+            f"{snap.primorsk_dispatch_delta_tankers_per_week:+.2f} tankers/wk",
+            delta=f"-{snap.ufa_throughput_loss_kbpd:.0f} kbpd at Novoyl",
+            delta_color="inverse",
+        )
+    st.markdown(
+        f"""
+        <div style="border:2px solid #ff9800;border-radius:12px;padding:14px 16px;margin:12px 0;
+          background:linear-gradient(180deg,#221100 0%,#0a0600 100%);">
+          <div style="color:#ffcc80;font-size:0.75rem;letter-spacing:0.14em;font-weight:900;margin-bottom:8px;">
+            SPILL PROBABILITY — ENVIRONMENTAL WAR TAX (BALTICS)</div>
+          <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;">
+            <div style="font-size:3rem;font-weight:1000;color:#ff9800;line-height:1;
+              text-shadow:0 0 20px rgba(255,152,0,0.85);">{snap.spill_probability_0_100}</div>
+            <div style="flex:1;min-width:220px;color:#ddd;font-size:1.02rem;line-height:1.5;">
+              Shadow tonnage (e.g. <b>Flora 1</b> pattern) trends <b>old, under-classed, effectively uninsurable</b>.
+              Any kinetic hit or crowded STS in the <b>Gotland gap</b> drives a heavy shoreline liability tail —
+              a <b style="color:#ffab40;">massive environmental war-tax</b> multiplier for Sweden, Estonia, Latvia,
+              Denmark, and German Baltic littorals.
+            </div>
+          </div>
+          <div style="margin-top:12px;height:10px;border-radius:6px;background:#1a1208;overflow:hidden;">
+            <div style="width:{snap.spill_probability_0_100}%;height:100%;
+              background:linear-gradient(90deg,#4e342e 0%,#ff9800 55%,#ff5722 100%);"></div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    with st.expander("Refinery–port correlation (module rule)", expanded=False):
+        st.markdown(
+            f"""
+            - **Ufa (Bashneft-Novoyl)** assumed programme loss: **{snap.ufa_throughput_loss_kbpd:.0f} kbpd**.
+            - **Scaling:** **{SHADOW_FLEET_KBPD_PER_TANKER_WEEK_PRIMORSK:.0f} kbpd** Ufa shortfall ≡ **1 Aframax-class**
+              Primorsk cargo-equivalent **per week**.
+            - Shown **Primorsk dispatch delta:** **{snap.primorsk_dispatch_delta_tankers_per_week:+.2f}** tankers/week
+              (negative = fewer liftings / upstream squeeze on Baltic export scheduling).
+            """
+        )
+
+
+def _add_gotland_transfer_zone_polygon(m: folium.Map) -> None:
+    """Gotland Transfer Zone polygon (matches ``logic.py`` bbox used for STS rules)."""
+    lat_a, lon_a = GOTLAND_TRANSFER_ZONE_LAT_MIN, GOTLAND_TRANSFER_ZONE_LON_MIN
+    lat_b, lon_b = GOTLAND_TRANSFER_ZONE_LAT_MAX, GOTLAND_TRANSFER_ZONE_LON_MAX
+    gj = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {"name": "Gotland Transfer Zone"},
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [
+                        [
+                            [lon_a, lat_a],
+                            [lon_b, lat_a],
+                            [lon_b, lat_b],
+                            [lon_a, lat_b],
+                            [lon_a, lat_a],
+                        ]
+                    ],
+                },
+            }
+        ],
+    }
+    folium.GeoJson(
+        gj,
+        style_function=lambda _: {
+            "fillColor": "#ff9800",
+            "color": "#ffe0b2",
+            "weight": 2,
+            "fillOpacity": 0.07,
+            "dashArray": "10 8",
+        },
+        tooltip=folium.Tooltip(
+            "Gotland Transfer Zone [57.0–59.0 N, 18.0–20.0 E] — STS path monitor",
+            sticky=True,
+        ),
+    ).add_to(m)
+
+
+def _add_shadow_fleet_intel_markers(m: folium.Map, rows: list[ShadowVesselAssessment]) -> None:
+    """Vessel markers: Gray Ghost (AIS stale), STS (purple), discharge alert (red)."""
+    for a in rows:
+        if not (a.gray_ghost or a.probable_sts or a.cargo_discharge_alert):
+            continue
+        if a.cargo_discharge_alert:
+            pulse_cls = "warroom-russia-kinetic-pulse"
+            border, fill = "#f44336", "rgba(244,67,54,0.48)"
+        elif a.gray_ghost:
+            pulse_cls = "warroom-gray-ghost-pulse"
+            border, fill = "#bdbdbd", "rgba(120,120,120,0.55)"
+        else:
+            pulse_cls = "warroom-sts-pulse"
+            border, fill = "#9c27b0", "rgba(156,39,176,0.48)"
+        marker_html = (
+            '<div style="width:52px;height:52px;display:flex;align-items:center;justify-content:center;">'
+            f'<div class="{pulse_cls}" style="width:38px;height:38px;border-radius:50%;'
+            f"background:{fill};border:3px solid {border};"
+            '"></div></div>'
+        )
+        tip = "\n".join([a.name, a.vessel_id, *(a.reasons or ())])
+        folium.Marker(
+            location=[a.latitude, a.longitude],
+            icon=folium.DivIcon(html=marker_html, icon_size=(52, 52), icon_anchor=(26, 26)),
+            tooltip=folium.Tooltip(tip, sticky=True),
+        ).add_to(m)
+
+
+def _add_gotland_gap_shadow_zone(m: folium.Map) -> None:
+    """Permanent orange pulsing STS hub east of Gotland."""
+    lat, lon = WAR_ROOM_GOTLAND_GAP_CENTER_LL
+    folium.Circle(
+        location=[lat, lon],
+        radius=WAR_ROOM_GOTLAND_GAP_RADIUS_M,
+        color="#ff9800",
+        weight=2,
+        fill=True,
+        fillColor="#ff9800",
+        fillOpacity=0.14,
+        tooltip=folium.Tooltip(WAR_ROOM_GOTLAND_GAP_TOOLTIP, sticky=True),
+        popup=folium.Popup(
+            f"<div style='min-width:240px;color:#111;padding:6px 2px;font-family:system-ui;'>"
+            f"<b style='color:#e65100;'>Gotland gap — STS shadow lane</b><br/>"
+            f"{html.escape(WAR_ROOM_GOTLAND_GAP_TOOLTIP)}</div>",
+            max_width=300,
+        ),
+    ).add_to(m)
+    pulse_html = (
+        '<div style="width:72px;height:72px;display:flex;align-items:center;justify-content:center;">'
+        '<div class="warroom-gotland-pulse" style="width:52px;height:52px;border-radius:50%;'
+        'background:rgba(255,152,0,0.42);border:4px solid #ff9800;"></div></div>'
+    )
+    folium.Marker(
+        location=[lat, lon],
+        icon=folium.DivIcon(html=pulse_html, icon_size=(72, 72), icon_anchor=(36, 36)),
+        tooltip=folium.Tooltip(WAR_ROOM_GOTLAND_GAP_TOOLTIP, sticky=True),
+    ).add_to(m)
 
 
 # Post–deadline scenario: port-level supply drop % (magnitude) and line status.
@@ -1069,10 +1326,12 @@ def _add_hormuz_conflict_marker(m: folium.Map) -> None:
 
 def build_tactical_war_room_map(
     trade_drop_pct: dict[str, float] | None = None,
+    shadow_fleet_assessments: list[ShadowVesselAssessment] | None = None,
 ) -> folium.Map:
     """
     Tactical overlay: Suez/Cape network, Hormuz branch, trade hubs, Russia heatmap
-    (Yaroslavl, Samara/Promsintez, Ufa), and LiveUAMap Ukraine oil-infra pulses when coords resolve.
+    (Yaroslavl, Samara/Promsintez, Ufa), Gotland transfer polygon + gap pulse, shadow-fleet vessel markers,
+    and LiveUAMap Ukraine oil-infra pulses.
     """
     m = folium.Map(
         location=[15.0, 45.0],
@@ -1161,6 +1420,14 @@ def build_tactical_war_room_map(
         _add_war_room_port_pin(m, port_pin)
 
     _add_hormuz_conflict_marker(m)
+    _add_gotland_transfer_zone_polygon(m)
+    _add_gotland_gap_shadow_zone(m)
+    _sf_rows = (
+        shadow_fleet_assessments
+        if shadow_fleet_assessments is not None
+        else demo_shadow_fleet_assessments(now=datetime.now(UTC))
+    )
+    _add_shadow_fleet_intel_markers(m, _sf_rows)
     _add_russia_heatmap_kinetic_markers(m)
     try:
         _add_ukraine_oil_infra_pulse_markers(m, _cached_ukraine_liveuamap_oil_infra_rows())
@@ -1865,6 +2132,7 @@ def main() -> None:
     tehran_official_rows, tehran_feed_caption = _cached_tehran_narrative()
     bgri_live_entries = _cached_live_entries()
     ukraine_oil_rows = _cached_ukraine_liveuamap_oil_infra_rows()
+    shadow_intel_assessments = _cached_shadow_fleet_assessments()
 
     st.markdown(
         '<div style="height:0.35rem" aria-hidden="true"></div>',
@@ -2031,9 +2299,35 @@ def main() -> None:
     render_x33_global_inventory_deficit_gauge()
     render_global_oil_inventory_clock(now)
     render_x33_industry_impact_table()
+    render_shadow_fleet_detection_panel(now)
 
     with st.sidebar:
         st.caption("UI build 2026-04-02c — if missing, Streamlit is not using this app.py")
+        _sfc = ShadowFleetIntelligence.fleet_confidence_percent(shadow_intel_assessments)
+        st.subheader("Shadow Fleet Intelligence")
+        st.metric(
+            "Shadow Fleet Confidence Score",
+            f"{_sfc}%",
+            help="Mean of: Gray Ghost rate (Russian list + AIS >4 h), Probable STS (Gotland box path), "
+            "Cargo discharge (draft −Δ>2 m off-port). Demo fleet until AIS ingest.",
+        )
+        st.caption("Map: **gray** = Gray Ghost, **violet** = Probable STS, **red** = discharge alert.")
+        with st.expander("Vessel assessments (demo)", expanded=False):
+            for _a in shadow_intel_assessments:
+                _flags = []
+                if _a.gray_ghost:
+                    _flags.append("Gray Ghost")
+                if _a.probable_sts:
+                    _flags.append("STS")
+                if _a.cargo_discharge_alert:
+                    _flags.append("Discharge")
+                st.markdown(
+                    f"**{html.escape(_a.name)}** `{html.escape(_a.vessel_id)}` — "
+                    f"{html.escape(', '.join(_flags) or 'clean')}"
+                )
+                if _a.reasons:
+                    for _r in _a.reasons:
+                        st.caption(html.escape(_r))
         st.subheader("DEEPSTATE KINETIC FEED")
         _ds_hits = _cached_deepstate_energy_hits()[:3]
         if not _ds_hits:
@@ -2177,8 +2471,8 @@ def main() -> None:
 
     st.subheader("War Room — Tactical Shipping Map")
     st.caption(
-        "Includes **Russia heatmap** (Yaroslavl, Samara/Promsintez, Ufa) and **LiveUAMap Ukraine oil feed** "
-        "(depot/refinery/terminal in the top sidebar slice) as additional red pulses when coordinates resolve."
+        "Includes **Russia heatmap**, **Gotland transfer polygon** (dashed), **STS hub pulse**, "
+        "**Shadow Fleet** vessel markers (gray / violet / red), and **LiveUAMap Ukraine** pulses."
     )
     _dl = now - DEADLINE_UTC
     if _dl.total_seconds() > 0:
@@ -2192,7 +2486,10 @@ def main() -> None:
             "Suez corridor assessed blocked under high kinetic risk; Cape of Good Hope diversion is the active lane (+~20 days)."
         )
     streamlit_folium.st_folium(
-        build_tactical_war_room_map(hs_main.trade_value_drop_pct),
+        build_tactical_war_room_map(
+            hs_main.trade_value_drop_pct,
+            shadow_fleet_assessments=shadow_intel_assessments,
+        ),
         use_container_width=True,
         height=460,
         returned_objects=[],
