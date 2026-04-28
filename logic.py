@@ -71,8 +71,8 @@ BBC_MIDDLE_EAST_RSS_URL = "https://feeds.bbci.co.uk/news/world/middle_east/rss.x
 # Browser-like defaults reduce blocks from Google RSS on cloud IPs.
 DEFAULT_RSS_REQUEST_HEADERS: dict[str, str] = {
     "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
     ),
     "Accept": "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.7",
     "Accept-Language": "en-US,en;q=0.9",
@@ -214,8 +214,21 @@ def fetch_live_rss_entries(
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
     }
-    r = requests.get(feed_url, headers=headers, timeout=timeout_s)
-    r.raise_for_status()
+    last_err: Exception | None = None
+    for _ in range(2):
+        try:
+            r = requests.get(
+                feed_url,
+                headers=headers,
+                timeout=timeout_s,
+                proxies={"http": None, "https": None},
+            )
+            r.raise_for_status()
+            break
+        except requests.exceptions.RequestException as err:
+            last_err = err
+    else:
+        raise RuntimeError(f"RSS fetch failed for {feed_url}: {last_err!s}") from last_err
 
     parsed = feedparser.parse(r.content)
     entries = getattr(parsed, "entries", []) or []
@@ -279,15 +292,28 @@ def fetch_live_google_news_multiquery(
     """
     merged: list[dict[str, str]] = []
     seen: set[tuple[str, str, str]] = set()
+    live_query_successes = 0
 
     for q in queries:
         q2 = q.strip()
         if " when:" not in q2.lower():
             q2 = f"{q2} when:1d"
         url = _google_news_rss_url(q2)
-        items = fetch_live_rss_entries(
-            url, limit=per_query_limit, timeout_s=timeout_s, request_headers=request_headers
-        )
+        try:
+            items = fetch_live_rss_entries(
+                url, limit=per_query_limit, timeout_s=timeout_s, request_headers=request_headers
+            )
+            if items:
+                live_query_successes += 1
+        except Exception:
+            items = [
+                _normalized_entry(
+                    dt=datetime.now(UTC).strftime("%a, %d %b %Y %H:%M:%S GMT"),
+                    source="Feed status",
+                    title=f"News temporarily unavailable ({q.strip()[:60]})",
+                    link="",
+                )
+            ]
         for it in items:
             key = (it.get("Source", ""), it.get("Title", ""), it.get("Link", ""))
             if key in seen:
@@ -313,6 +339,18 @@ def fetch_live_google_news_multiquery(
                 merged.append(it)
         except Exception:
             pass
+
+    # If every Google query failed, don't flood UI with placeholder lines.
+    # Keep one explicit status row and let ground-truth fill the rest.
+    if live_query_successes == 0:
+        merged = [
+            _normalized_entry(
+                dt=datetime.now(UTC).strftime("%a, %d %b %Y %H:%M:%S GMT"),
+                source="Feed status",
+                title="All open-source news providers temporarily unavailable on current network path.",
+                link="",
+            )
+        ]
 
     if len(merged) < min_results:
         now_label = datetime.now(UTC).strftime("%a, %d %b %Y %H:%M:%S GMT")
@@ -437,7 +475,9 @@ def _fetch_liveuamap_home_html(url: str, *, timeout_s: float, base_headers: dict
             "Sec-Fetch-Mode": "navigate",
         }
         try:
-            r = requests.get(url, headers=h, timeout=timeout_s)
+            r = requests.get(
+                url, headers=h, timeout=timeout_s, proxies={"http": None, "https": None}
+            )
             r.raise_for_status()
             if "recd_descr" in r.text:
                 return r.text
@@ -459,7 +499,9 @@ def _fetch_liveuamap_ukraine_sidebar_html(
             "Sec-Fetch-Mode": "navigate",
         }
         try:
-            r = requests.get(url, headers=h, timeout=timeout_s)
+            r = requests.get(
+                url, headers=h, timeout=timeout_s, proxies={"http": None, "https": None}
+            )
             r.raise_for_status()
             if 'class="event' in r.text or "class='event" in r.text:
                 return r.text
@@ -494,7 +536,9 @@ def _liveuamap_event_page_latlng(
             "Sec-Fetch-Mode": "navigate",
         }
         try:
-            r = requests.get(dest, headers=h, timeout=timeout_s)
+            r = requests.get(
+                dest, headers=h, timeout=timeout_s, proxies={"http": None, "https": None}
+            )
             r.raise_for_status()
             m = _RE_LU_EVENT_PAGE_LATLNG.search(r.text)
             if not m:
@@ -682,7 +726,13 @@ def fetch_newsdata_iran_feed(
     }
     def call(params: dict[str, str | int]) -> tuple[list[dict[str, str]], str | None]:
         try:
-            r = requests.get(NEWSDATA_API_LATEST, params=params, headers=headers, timeout=timeout_s)
+            r = requests.get(
+                NEWSDATA_API_LATEST,
+                params=params,
+                headers=headers,
+                timeout=timeout_s,
+                proxies={"http": None, "https": None},
+            )
             r.raise_for_status()
             payload = r.json()
         except requests.exceptions.HTTPError as e:
@@ -778,7 +828,22 @@ def fetch_official_tehran_narrative(
     tail = hint_nd
     if not tail:
         tail = "No articles from NewsData.io or Press TV RSS (check network or feeds)."
-    return [], tail
+    now_label = datetime.now(UTC).strftime("%a, %d %b %Y %H:%M:%S GMT")
+    fallback_rows = [
+        _normalized_entry(
+            dt=now_label,
+            source="Fallback brief",
+            title="Tehran narrative feed temporarily unavailable (network/provider block).",
+            link="",
+        ),
+        _normalized_entry(
+            dt=now_label,
+            source="Fallback brief",
+            title="Showing continuity mode until live Iran-source feeds recover.",
+            link="",
+        ),
+    ]
+    return fallback_rows, tail
 
 
 def fetch_liveuamap_mideast_kinetic(
@@ -851,6 +916,17 @@ def fetch_liveuamap_mideast_kinetic(
                     break
         except Exception:
             pass
+
+    if not ordered:
+        now_stamp = datetime.now(UTC).strftime("%a, %d %b %Y %H:%M:%S GMT")
+        ordered.append(
+            _normalized_entry(
+                dt=now_stamp,
+                source="Kinetic monitor status",
+                title="No live kinetic feed available (provider/network blocked).",
+                link="",
+            )
+        )
 
     return ordered, hormuz_kinetic
 
@@ -1025,9 +1101,20 @@ class HormuzStats:
 
 
 def _query_arcgis_feature_layer(url: str, *, params: dict[str, Any], timeout_s: float = 12.0) -> dict[str, Any]:
-    r = requests.get(url, params=params, timeout=timeout_s)
-    r.raise_for_status()
-    return r.json()
+    last_err: Exception | None = None
+    for _ in range(2):
+        try:
+            r = requests.get(
+                url,
+                params=params,
+                timeout=timeout_s,
+                proxies={"http": None, "https": None},
+            )
+            r.raise_for_status()
+            return r.json()
+        except requests.exceptions.RequestException as err:
+            last_err = err
+    raise RuntimeError(f"ArcGIS request failed for {url}: {last_err!s}") from last_err
 
 
 def _latest_value_for_where(
@@ -1099,13 +1186,17 @@ def fetch_hormuz_stats(
     notes: list[str] = []
 
     # Daily transits through Hormuz.
-    attrs = _latest_value_for_where(
-        PORTWATCH_FEATURESERVER_URL,
-        where="portname='Strait of Hormuz'",
-        out_fields="date,n_total",
-        order_by="date DESC",
-        timeout_s=timeout_s,
-    )
+    try:
+        attrs = _latest_value_for_where(
+            PORTWATCH_FEATURESERVER_URL,
+            where="portname='Strait of Hormuz'",
+            out_fields="date,n_total",
+            order_by="date DESC",
+            timeout_s=timeout_s,
+        )
+    except Exception as e:
+        attrs = None
+        notes.append(f"Hormuz transit feed temporarily unavailable: {e!s}")
     asof_dt = None
     daily_transits = None
     if attrs:
@@ -1121,13 +1212,17 @@ def fetch_hormuz_stats(
             daily_transits = None
 
     # Wait-list proxy: Fujairah tanker port calls (daily).
-    fuj = _latest_value_for_where(
-        DAILY_PORTS_FEATURESERVER_URL,
-        where="portname='Fujairah'",
-        out_fields="date,portcalls_tanker",
-        order_by="date DESC",
-        timeout_s=timeout_s,
-    )
+    try:
+        fuj = _latest_value_for_where(
+            DAILY_PORTS_FEATURESERVER_URL,
+            where="portname='Fujairah'",
+            out_fields="date,portcalls_tanker",
+            order_by="date DESC",
+            timeout_s=timeout_s,
+        )
+    except Exception as e:
+        fuj = None
+        notes.append(f"Fujairah wait-list feed temporarily unavailable: {e!s}")
     wait_list_proxy = None
     if fuj:
         try:
@@ -1140,7 +1235,11 @@ def fetch_hormuz_stats(
     regions = {"EU": "European Union", "China": "China", "US": "United States"}
     trade_drop: dict[str, float] = {}
     for k, region in regions.items():
-        latest, prev = _latest_two_trade_values_for_region(region, timeout_s=timeout_s)
+        try:
+            latest, prev = _latest_two_trade_values_for_region(region, timeout_s=timeout_s)
+        except Exception as e:
+            notes.append(f"Trade nowcast feed unavailable for {k}: {e!s}")
+            continue
         if latest is None or prev is None or prev == 0:
             continue
         pct_change = (latest - prev) / prev * 100.0
@@ -1177,9 +1276,20 @@ def _arcgis_query(
         "resultRecordCount": record_count,
         "returnGeometry": "false",
     }
-    r = requests.get(url, params=params, timeout=timeout_s)
-    r.raise_for_status()
-    return r.json()
+    last_err: Exception | None = None
+    for _ in range(2):
+        try:
+            r = requests.get(
+                url,
+                params=params,
+                timeout=timeout_s,
+                proxies={"http": None, "https": None},
+            )
+            r.raise_for_status()
+            return r.json()
+        except requests.exceptions.RequestException as err:
+            last_err = err
+    raise RuntimeError(f"ArcGIS transit query failed for {url}: {last_err!s}") from last_err
 
 
 def _latest_transits_for_portname(portname: str, *, timeout_s: float = 12.0) -> tuple[datetime | None, int | None]:
@@ -1363,7 +1473,12 @@ def get_deepstate_updates(
     headers = request_headers or dict(DEFAULT_RSS_REQUEST_HEADERS)
     out: list[DeepStateEnergyHit] = []
     try:
-        r = requests.get(channel_web_url, headers=headers, timeout=timeout_s)
+        r = requests.get(
+            channel_web_url,
+            headers=headers,
+            timeout=timeout_s,
+            proxies={"http": None, "https": None},
+        )
         r.raise_for_status()
     except Exception:
         return []

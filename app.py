@@ -55,8 +55,8 @@ def _cached_hormuz_stats():
 # Sent with RSS fetches so cloud egress IPs are less likely to be blocked by Google News.
 NEWS_RSS_REQUEST_HEADERS: dict[str, str] = {
     "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/131.0.0.0 Safari/537.36"
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
     ),
     "Accept": "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.7",
     "Accept-Language": "en-US,en;q=0.9",
@@ -88,6 +88,35 @@ OIL_DEPLETION_METER_SCALE_MMBBL = 650.0
 # Global strategic buffer runway (scenario): 1.5B bbl ÷ |net daily deficit| → days to theoretical dry-up
 GLOBAL_STRATEGIC_RESERVE_MMBBL = 1500.0
 
+# Live IEA-style emergency buffer countdown (bleeds by scenario net deficit)
+# User-facing knobs (requested names):
+app_launch_date = "2026-04-01"  # YYYY-MM-DD (kept for reference / audit)
+initial_buffer = 400.0  # M bbl (IEA emergency release amount)
+
+# War anchor for cumulative deficit tracking (requested: “since the start of the war”)
+WAR_START_DT_UTC = datetime(
+    HORMUZ_OIL_CLOSURE_START_DATE.year,
+    HORMUZ_OIL_CLOSURE_START_DATE.month,
+    HORMUZ_OIL_CLOSURE_START_DATE.day,
+    0,
+    0,
+    0,
+    tzinfo=UTC,
+)
+
+
+def _disable_proxy_env_for_live_feeds() -> None:
+    """Avoid inherited proxy vars that trigger 403 tunnel blocks on feeds/APIs."""
+    for k in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ):
+        os.environ.pop(k, None)
+
 
 def net_daily_deficit() -> float:
     """X33: (losses) + (remedies), mio bpd."""
@@ -109,6 +138,96 @@ def accumulated_deficit_33d() -> float:
 def oil_net_daily_deficit_mbpd() -> float:
     """Alias for buffers / legacy call sites — same as X33 net daily deficit."""
     return net_daily_deficit()
+
+
+def _iea_buffer_countdown_metrics(
+    *, now_utc: datetime | None = None
+) -> tuple[float, float, int, float, float]:
+    """
+    Returns
+      (buffer_remaining_mmbbl, total_bleed_mmbbl, days_active, net_daily_mbpd, runway_days).
+
+    ``total_bleed`` = days_active × |net_daily_deficit|; ``buffer_remaining`` = initial_buffer − bleed.
+    ``runway_days`` = buffer_remaining ÷ |net_daily_deficit| when in net drawdown, else inf.
+    """
+    now = now_utc if now_utc is not None else datetime.now(UTC)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
+
+    # Fractional days since war start so the deficit tracker reflects cumulative losses vs buffer.
+    seconds_active = max(0.0, (now - WAR_START_DT_UTC).total_seconds())
+    days_active_f = seconds_active / 86400.0
+    days_active = int(days_active_f)
+    nd = float(net_daily_deficit())
+    # Only count drawdown when the scenario is in deficit (negative net).
+    draw = max(0.0, -nd)
+    total_bleed = float(days_active_f) * draw
+    remaining = float(initial_buffer) - total_bleed
+    if draw > 1e-9:
+        runway = max(0.0, remaining) / draw
+    else:
+        runway = float("inf")
+    return remaining, total_bleed, days_active, nd, runway
+
+
+def _live_iea_buffer_countdown_body() -> None:
+    """Refreshable block: IEA buffer remaining + runway (invoked via ``st.fragment`` when available)."""
+    now = datetime.now(UTC)
+    remaining, total_bleed, days_active, nd, runway = _iea_buffer_countdown_metrics(now_utc=now)
+    st.markdown(
+        """
+        <div class="oil-buffer-runway oil-buffer-runway--live">
+            <div class="obr-title">GLOBAL BUFFER REMAINING — WAR-TO-DATE DEFICIT TRACK</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric(
+            "Buffer remaining",
+            f"{remaining:.1f} M bbl",
+            delta=f"−{total_bleed:.1f} M bbl bleed to date",
+            delta_color="inverse",
+            help=f"Initial IEA-style pool {initial_buffer:.0f} M bbl "
+            f"minus (war-to-date days active) × max(0, −net_daily_deficit).",
+        )
+    with c2:
+        if math.isfinite(runway) and runway != float("inf"):
+            st.metric(
+                "Runway @ current draw",
+                f"{runway:.1f} days",
+                help="(buffer remaining) ÷ max(0, −net_daily_deficit) at scenario rates.",
+            )
+        elif remaining <= 0:
+            st.metric("Runway @ current draw", "0.0 days", delta="Pool overdrawn", delta_color="inverse")
+        else:
+            st.metric("Runway @ current draw", "—", help="Scenario not in net drawdown — no countdown.")
+    with c3:
+        war_to_date_mmbbl = total_bleed
+        pct_used = 0.0 if initial_buffer <= 1e-9 else (war_to_date_mmbbl / float(initial_buffer) * 100.0)
+        st.metric(
+            "War-to-date deficit",
+            f"{war_to_date_mmbbl:.1f} M bbl",
+            delta=f"{pct_used:.0f}% of {initial_buffer:.0f} M bbl pool",
+            delta_color="inverse" if pct_used >= 100.0 else "normal",
+            help="Cumulative net drawdown since war start = (days since war start) × max(0, −net_daily_deficit).",
+        )
+
+    st.caption(
+        f"War start anchor UTC: **{WAR_START_DT_UTC.strftime('%Y-%m-%d %H:%M:%S')}** · "
+        f"**{days_active}** day(s) + fractional active · "
+        f"Now (live): `{now.strftime('%Y-%m-%d %H:%M:%S')} UTC` · "
+        f"net_daily_deficit = **{nd:+.2f}** mio bpd"
+    )
+
+
+# Re-run buffer metrics on a short cadence so tablet / iPad viewers see a ticking countdown.
+_run_live_iea_buffer_countdown = (
+    st.fragment(run_every=timedelta(seconds=5))(_live_iea_buffer_countdown_body)
+    if hasattr(st, "fragment")
+    else _live_iea_buffer_countdown_body
+)
 
 
 # Russian secondary-shock Discerner (incremental cut beyond headline −1.0 mio bpd scenario):
@@ -334,7 +453,7 @@ def recent_kinetic_strike_osint_titles(rows: list[dict], *, limit: int = 5) -> l
 
 
 def _render_osint_style_marquee(display_lines: list[str], *, empty_fallback: str) -> None:
-    """Shared full-width yellow monospace ticker (same chrome as kinetic OSINT marquee)."""
+    """Shared full-width calm monochrome ticker."""
     sep = "    •    "
     if not display_lines:
         core = html.escape(empty_fallback)
@@ -346,8 +465,8 @@ def _render_osint_style_marquee(display_lines: list[str], *, empty_fallback: str
         <div class="osint-marquee-wrap">
           <style>
             .osint-marquee-wrap {{
-              background: #000000;
-              border-bottom: 2px solid #3d3d3d;
+              background: #111316;
+              border-bottom: 1px solid #2c333a;
               overflow: hidden;
               padding: 10px 0;
               margin-top: 0;
@@ -366,10 +485,10 @@ def _render_osint_style_marquee(display_lines: list[str], *, empty_fallback: str
               100% {{ transform: translateX(-50%); }}
             }}
             .osint-marquee-text {{
-              color: #ffff00;
+              color: #d7dee6;
               font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-              font-weight: 700;
-              font-size: 1.08rem;
+              font-weight: 600;
+              font-size: 1rem;
               letter-spacing: 0.02em;
               white-space: nowrap;
               flex-shrink: 0;
@@ -416,16 +535,16 @@ def render_bgri_attention_gauge(
     global_panic = min(100, max(0, bgri.score + _panic_bump))
 
     if global_panic > 70:
-        val_color = "#ff3b3b"
-        bar_color = "linear-gradient(90deg, #ffdd00 0%, #ff3b3b 100%)"
+        val_color = "#d17b7b"
+        bar_color = "linear-gradient(90deg, #8a9aa8 0%, #d17b7b 100%)"
         fw = "900"
     elif global_panic < 30:
-        val_color = "#2ee85a"
-        bar_color = "linear-gradient(90deg, #1a6b32 0%, #2ee85a 100%)"
+        val_color = "#7aa68a"
+        bar_color = "linear-gradient(90deg, #4f5f69 0%, #7aa68a 100%)"
         fw = "700"
     else:
-        val_color = "#fffacd"
-        bar_color = "linear-gradient(90deg, #c9a000 0%, #fffacd 100%)"
+        val_color = "#c8b890"
+        bar_color = "linear-gradient(90deg, #6e7a86 0%, #c8b890 100%)"
         fw = "800"
 
     pct = max(0, min(100, global_panic))
@@ -479,7 +598,7 @@ def render_bgri_attention_gauge(
                 unsafe_allow_html=True,
             )
             st.markdown(
-                f'<p style="margin:10px 0 6px 0;font-size:1.2rem;font-weight:800;color:#ffaa66;">'
+                f'<p style="margin:10px 0 6px 0;font-size:1.2rem;font-weight:800;color:#b9a890;">'
                 f"Δ {bgri.pct_vs_baseline:+.0f}% vs baseline • "
                 f'hits <b style="color:#fff">{bgri.today_hits}</b> / norm <b style="color:#fff">{BGRI_BASELINE_HITS:g}</b></p>',
                 unsafe_allow_html=True,
@@ -520,7 +639,7 @@ def _prepare_intel_dataframe(
 def _intel_highlight_row(row):
     title = str(row.get("Title", "")).lower()
     if ("target" in title) or ("strike" in title):
-        return ["background-color: rgba(255, 215, 0, 0.22)"] * len(row)
+        return ["background-color: rgba(190, 175, 135, 0.14)"] * len(row)
     return [""] * len(row)
 
 
@@ -531,7 +650,7 @@ def _ukraine_oil_intel_highlight_row(row):
         k in title
         for k in ("target", "strike", "refinery", "depot", "terminal", "attack", "fire", "drone")
     ):
-        return ["background-color: rgba(255, 215, 0, 0.22)"] * len(row)
+        return ["background-color: rgba(190, 175, 135, 0.14)"] * len(row)
     return [""] * len(row)
 
 
@@ -625,10 +744,10 @@ def _trade_drop_bracket_color(drop_pct: float | None) -> tuple[str, float]:
     """Green <5%, Orange 5–20%, Red >20%; returns (hex, magnitude %)."""
     d = abs(float(drop_pct)) if drop_pct is not None else 0.0
     if d < 5.0:
-        return "#2ee85a", d
+        return "#7aa68a", d
     if d <= 20.0:
-        return "#ff9800", d
-    return "#ff3b3b", d
+        return "#b9a37a", d
+    return "#c49090", d
 
 
 def _inventory_days_remaining(supply_chain_shock_pct: float) -> float:
@@ -677,7 +796,11 @@ EU27_ADM0_A3: frozenset[str] = frozenset(
 @st.cache_data(ttl=86_400, show_spinner=False)
 def _cached_natural_earth_50m_countries() -> dict | None:
     try:
-        r = requests.get(NE_50M_COUNTRIES_GEOJSON_URL, timeout=35)
+        r = requests.get(
+            NE_50M_COUNTRIES_GEOJSON_URL,
+            timeout=35,
+            proxies={"http": None, "https": None},
+        )
         r.raise_for_status()
         data = r.json()
         if data.get("type") != "FeatureCollection":
@@ -702,85 +825,66 @@ def _geojson_feature_subset(full: dict | None, iso_codes: frozenset[str]) -> dic
 
 
 def _war_room_leaflet_contrast_css() -> str:
-    """Dark tooltip / popup chrome for Carto dark tiles (high-contrast for outdoor / bright screens)."""
+    """Dark tooltip / popup chrome in a calmer low-glow palette."""
     return """
         <style>
         .leaflet-tooltip {
-          background: #0a0a0a !important;
-          background-color: #0a0a0a !important;
-          border: 2px solid #ffff00 !important;
-          color: #ffff00 !important;
-          font-weight: 700 !important;
+          background: #14181c !important;
+          background-color: #14181c !important;
+          border: 1px solid #5d6a77 !important;
+          color: #d7dee6 !important;
+          font-weight: 600 !important;
           font-family: ui-monospace, Menlo, Monaco, Consolas, monospace !important;
           font-size: 13px !important;
           padding: 8px 12px !important;
-          box-shadow: 0 0 14px rgba(255, 255, 0, 0.35) !important;
+          box-shadow: 0 2px 8px rgba(0, 0, 0, 0.28) !important;
         }
         .leaflet-tooltip-top:before,
         .leaflet-tooltip-bottom:before,
         .leaflet-tooltip-left:before,
         .leaflet-tooltip-right:before {
-          border-top-color: #ffff00 !important;
+          border-top-color: #5d6a77 !important;
         }
         .leaflet-popup-content-wrapper {
-          background: #101010 !important;
-          color: #ffffff !important;
-          border: 2px solid #ffff00 !important;
+          background: #161b20 !important;
+          color: #e4e9ee !important;
+          border: 1px solid #5d6a77 !important;
           border-radius: 10px !important;
         }
         .leaflet-popup-tip {
-          background: #101010 !important;
-          border: 1px solid #ffff00 !important;
+          background: #161b20 !important;
+          border: 1px solid #5d6a77 !important;
           box-shadow: none !important;
         }
         .leaflet-popup-content {
           margin: 12px 14px !important;
           font-size: 14px !important;
           line-height: 1.45 !important;
-          color: #ffffff !important;
-        }
-        @keyframes warroomTriesteBlink {
-          0%, 100% { transform: scale(1); opacity: 1; }
-          50% { transform: scale(1.42); opacity: 0.32; }
+          color: #e4e9ee !important;
         }
         .warroom-trieste-blink-inner {
-          box-shadow: 0 0 20px rgba(255, 0, 0, 0.95);
-          animation: warroomTriesteBlink 0.85s ease-in-out infinite;
+          box-shadow: none;
+          opacity: 0.92;
         }
         .warroom-russia-kinetic-pulse {
-          box-shadow: 0 0 24px rgba(255, 0, 0, 0.98);
-          animation: warroomTriesteBlink 0.9s ease-in-out infinite;
-        }
-        @keyframes warroomPulse {
-          0%, 100% { transform: scale(1); opacity: 0.95; }
-          50% { transform: scale(1.38); opacity: 0.42; }
+          box-shadow: none;
+          opacity: 0.9;
         }
         .warroom-hormuz-pulse-inner {
-          animation: warroomPulse 1.15s ease-in-out infinite;
-        }
-        @keyframes warroomGotlandPulse {
-          0%, 100% { transform: scale(1); opacity: 0.9; }
-          50% { transform: scale(1.22); opacity: 0.4; }
+          box-shadow: none;
+          opacity: 0.9;
         }
         .warroom-gotland-pulse {
-          animation: warroomGotlandPulse 1.05s ease-in-out infinite;
-          box-shadow: 0 0 26px rgba(255, 152, 0, 0.92);
-        }
-        @keyframes warroomGrayGhostPulse {
-          0%, 100% { transform: scale(1); opacity: 0.85; }
-          50% { transform: scale(1.18); opacity: 0.38; }
+          box-shadow: none;
+          opacity: 0.88;
         }
         .warroom-gray-ghost-pulse {
-          animation: warroomGrayGhostPulse 1.35s ease-in-out infinite;
-          box-shadow: 0 0 20px rgba(189, 189, 189, 0.9);
-        }
-        @keyframes warroomStsVioletPulse {
-          0%, 100% { transform: scale(1); opacity: 0.88; }
-          50% { transform: scale(1.14); opacity: 0.45; }
+          box-shadow: none;
+          opacity: 0.88;
         }
         .warroom-sts-pulse {
-          animation: warroomStsVioletPulse 1.1s ease-in-out infinite;
-          box-shadow: 0 0 22px rgba(156, 39, 176, 0.88);
+          box-shadow: none;
+          opacity: 0.88;
         }
         </style>
         """
@@ -1185,7 +1289,7 @@ def _russia_kinetic_site_popup_html(title: str, body_html_lines: tuple[str, ...]
 
 
 def _add_ukraine_oil_infra_pulse_markers(m: folium.Map, rows: list[UkraineOilInfraScrapeRow]) -> None:
-    """Red pulsing DivIcons — LiveUAMap Ukraine oil-feed rows (depot / refinery / terminal) with resolved coords."""
+    """Static subdued markers — LiveUAMap Ukraine oil-feed rows with resolved coords."""
     for row in rows:
         if row.lat is None or row.lon is None:
             continue
@@ -1211,7 +1315,7 @@ def _add_ukraine_oil_infra_pulse_markers(m: folium.Map, rows: list[UkraineOilInf
             'justify-content:center;">'
             '<div class="warroom-russia-kinetic-pulse" style="'
             "width:42px;height:42px;border-radius:50%;"
-            "background:rgba(255,0,0,0.5);border:3px solid #ff0000;"
+            "background:rgba(122, 152, 176, 0.32);border:2px solid #8aa0b5;"
             '"></div></div>'
         )
         folium.Marker(
@@ -1223,7 +1327,7 @@ def _add_ukraine_oil_infra_pulse_markers(m: folium.Map, rows: list[UkraineOilInf
 
 
 def _add_russia_heatmap_kinetic_markers(m: folium.Map) -> None:
-    """Pulsing red markers — Russia OSINT kinetic layer (Yaroslavl, Samara, Ufa)."""
+    """Static subdued markers — Russia OSINT kinetic layer (Yaroslavl, Samara, Ufa)."""
     ufa_popup = _russia_kinetic_site_popup_html(
         "Ufa — Bashneft-Novoyl",
         (
@@ -1252,7 +1356,7 @@ def _add_russia_heatmap_kinetic_markers(m: folium.Map) -> None:
             'justify-content:center;">'
             '<div class="warroom-russia-kinetic-pulse" style="'
             "width:42px;height:42px;border-radius:50%;"
-            "background:rgba(255,0,0,0.5);border:3px solid #ff0000;"
+            "background:rgba(122, 152, 176, 0.32);border:2px solid #8aa0b5;"
             '"></div></div>'
         )
         folium.Marker(
@@ -1280,7 +1384,7 @@ def _add_war_room_port_pin(m: folium.Map, pin: WarRoomPortPin) -> None:
             'justify-content:center;">'
             '<div class="warroom-trieste-blink-inner" style="'
             "width:46px;height:46px;border-radius:50%;"
-            "background:rgba(255,0,0,0.55);border:4px solid #ff0000;"
+            "background:rgba(125, 150, 172, 0.38);border:2px solid #8aa0b5;"
             '"></div></div>'
         )
         folium.Marker(
@@ -1313,8 +1417,8 @@ def _add_hormuz_conflict_marker(m: folium.Map) -> None:
         'justify-content:center;">'
         '<div class="warroom-hormuz-pulse-inner" style="'
         "width:40px;height:40px;border-radius:50%;"
-        "background:rgba(255,140,0,0.45);border:3px solid #ff9800;"
-        'box-shadow:0 0 18px rgba(255,152,0,0.95);"></div></div>'
+        "background:rgba(142, 161, 178, 0.34);border:2px solid #8ea1b2;"
+        '"></div></div>'
     )
     folium.Marker(
         location=[lat, lon],
@@ -1437,6 +1541,148 @@ def build_tactical_war_room_map(
     return m
 
 
+def tactical_shipping_risk_table(
+    *,
+    trade_drop_pct: dict[str, float] | None,
+    shadow_fleet_assessments: list[ShadowVesselAssessment] | None,
+    ukraine_oil_rows: list[UkraineOilInfraScrapeRow],
+) -> pd.DataFrame:
+    """Table replacement for the tactical map using the same underlying signals."""
+    rows: list[dict[str, str]] = []
+    td = trade_drop_pct or {}
+
+    rows.append(
+        {
+            "Layer": "Route",
+            "Location": "Suez Corridor",
+            "Coordinates": "Shanghai → Shenzhen → Malacca → Bab el-Mandeb → Suez → Trieste",
+            "Status": "Blocked",
+            "Detail": "Suez route is treated as disrupted in current scenario.",
+        }
+    )
+    rows.append(
+        {
+            "Layer": "Route",
+            "Location": "Cape Route",
+            "Coordinates": "Asia → Cape of Good Hope → North Atlantic → Rotterdam",
+            "Status": "Active",
+            "Detail": "Primary fallback lane under elevated kinetic risk.",
+        }
+    )
+    rows.append(
+        {
+            "Layer": "Route",
+            "Location": "Conflict Branch",
+            "Coordinates": "Malacca → Strait of Hormuz",
+            "Status": "Risk Branch",
+            "Detail": "Monitored branch for shipping disruption and escalation risk.",
+        }
+    )
+
+    for p in WAR_ROOM_PORT_PINS:
+        rows.append(
+            {
+                "Layer": "Port",
+                "Location": p.port_name,
+                "Coordinates": f"{p.lat:.3f}, {p.lon:.3f}",
+                "Status": p.status,
+                "Detail": f"Incoming supply drop: -{p.supply_drop_mag:.1f}%",
+            }
+        )
+
+    hormuz_lat, hormuz_lon = WAR_ROOM_HORMUZ_LAT_LON
+    rows.append(
+        {
+            "Layer": "Chokepoint",
+            "Location": "Strait of Hormuz",
+            "Coordinates": f"{hormuz_lat:.3f}, {hormuz_lon:.3f}",
+            "Status": "Constructive Total Loss Zone",
+            "Detail": "Conflict branch endpoint and key chokepoint monitor.",
+        }
+    )
+
+    got_lat, got_lon = WAR_ROOM_GOTLAND_GAP_CENTER_LL
+    rows.append(
+        {
+            "Layer": "Zone",
+            "Location": "Gotland Gap",
+            "Coordinates": f"{got_lat:.3f}, {got_lon:.3f} (r={WAR_ROOM_GOTLAND_GAP_RADIUS_M:,}m)",
+            "Status": "STS Watch",
+            "Detail": WAR_ROOM_GOTLAND_GAP_TOOLTIP,
+        }
+    )
+
+    for label, lat, lon, tip_line in _RUSSIA_HEATMAP_SITES:
+        rows.append(
+            {
+                "Layer": "Kinetic Site",
+                "Location": label,
+                "Coordinates": f"{lat:.3f}, {lon:.3f}",
+                "Status": "Monitored",
+                "Detail": tip_line,
+            }
+        )
+
+    sf_rows = (
+        shadow_fleet_assessments
+        if shadow_fleet_assessments is not None
+        else demo_shadow_fleet_assessments(now=datetime.now(UTC))
+    )
+    for a in sf_rows:
+        status_flags: list[str] = []
+        if a.gray_ghost:
+            status_flags.append("Gray Ghost")
+        if a.probable_sts:
+            status_flags.append("Probable STS")
+        if a.cargo_discharge_alert:
+            status_flags.append("Discharge Alert")
+        rows.append(
+            {
+                "Layer": "Shadow Fleet",
+                "Location": a.name,
+                "Coordinates": f"{a.latitude:.3f}, {a.longitude:.3f}",
+                "Status": ", ".join(status_flags) if status_flags else "Clean",
+                "Detail": "; ".join(a.reasons) if a.reasons else "No high-risk shadow-fleet signal.",
+            }
+        )
+
+    for r in ukraine_oil_rows:
+        if r.lat is None or r.lon is None:
+            continue
+        rows.append(
+            {
+                "Layer": "Ukraine Oil Feed",
+                "Location": "LiveUAMap event",
+                "Coordinates": f"{r.lat:.3f}, {r.lon:.3f}",
+                "Status": r.time,
+                "Detail": r.title,
+            }
+        )
+
+    cn_mag = _incoming_supply_chain_drop_numeric("China", td)
+    eu_mag = _incoming_supply_chain_drop_numeric("EU", td)
+    rows.append(
+        {
+            "Layer": "Overlay",
+            "Location": "China Trade Overlay",
+            "Coordinates": "Country polygon",
+            "Status": "Scenario",
+            "Detail": f"Total China Trade Drop: -{cn_mag:.1f}%",
+        }
+    )
+    rows.append(
+        {
+            "Layer": "Overlay",
+            "Location": "EU Supply Overlay",
+            "Coordinates": "EU-27 polygon",
+            "Status": "Scenario",
+            "Detail": f"Total EU Supply Chain Drop: -{eu_mag:.1f}%",
+        }
+    )
+
+    return pd.DataFrame(rows)
+
+
 def shipping_impact_table(now_utc: datetime) -> pd.DataFrame:
     """
     'Suez vs Cape' transit impact for the three EU ports.
@@ -1502,39 +1748,39 @@ def render_x33_global_inventory_deficit_gauge() -> None:
     st.markdown(
         f"""
         <div class="x33-deficit-gauge" style="
-          border:4px solid #ff0000;
+          border:1px solid #5d6a77;
           border-radius:16px;
           padding:26px 24px;
           margin:0 0 16px 0;
-          background:linear-gradient(180deg,#400000 0%,#050000 100%);
-          box-shadow:0 0 42px rgba(255,0,0,0.55);
+          background:linear-gradient(180deg,#1a2026 0%,#12171c 100%);
+          box-shadow:0 8px 18px rgba(0,0,0,0.22);
           text-align:center;">
           <div style="
             font-size:0.88rem;
             letter-spacing:0.24em;
-            color:#ffdede;
+            color:#c8d0d8;
             font-weight:900;
             margin-bottom:12px;">
             X33 ACCUMULATED DEFICIT</div>
           <div style="
             font-size:4.1rem;
             font-weight:1000;
-            color:#ff0000;
+            color:#d39a9a;
             line-height:1.0;
-            text-shadow:0 0 28px rgba(255,0,0,0.95);
+            text-shadow:none;
             font-variant-numeric:tabular-nums;">
             {abs_m:.1f}M</div>
           <div style="
             font-size:1.5rem;
-            color:#ff5555;
+            color:#afbcc8;
             font-weight:900;
             letter-spacing:0.1em;">
             BARRELS</div>
           <div style="font-size:0.95rem;color:#b8b8b8;margin-top:14px;line-height:1.5;">
-            <code style="background:#1a0000;color:#ffb4b4;padding:2px 6px;border-radius:4px;">accumulated_33d</code>
+            <code style="background:#232a31;color:#c7d0d9;padding:2px 6px;border-radius:4px;">accumulated_33d</code>
             = net_daily_deficit (<b style="color:#fff;">{nd:+.1f}</b> mio bpd)
             × <b style="color:#fff;">{X33_WINDOW_DAYS}</b> d
-            = <b style="color:#ff6666;">{acc:+.1f}</b> M bbl
+            = <b style="color:#d7b3b3;">{acc:+.1f}</b> M bbl
           </div>
         </div>
         """,
@@ -1583,7 +1829,7 @@ def render_ukraine_oil_infra_intel_panel(
     st.markdown("### UKRAINE OIL INFRA — LIVEUAMAP")
     st.caption(
         "Depot / refinery / terminal from the Ukraine LiveUAMap sidebar (up to five). "
-        "Tactical map adds red pulses when event pages resolve coordinates."
+        "Tactical map adds location markers when event pages resolve coordinates."
     )
     if not oil_rows:
         st.caption(
@@ -1618,9 +1864,6 @@ def render_global_oil_inventory_clock(now_utc: datetime) -> None:
     remediation_total = remedy_ksa_yanbu + remedy_uae_fujairah + remedy_iraq_turkey
     net_daily_mbpd = net_daily_deficit()
     acc33 = accumulated_33d()
-    buffer_days: float | None = None
-    if net_daily_mbpd < -1e-9:
-        buffer_days = GLOBAL_STRATEGIC_RESERVE_MMBBL / abs(net_daily_mbpd)
     total_depletion_mmbbl = net_daily_mbpd * float(days_since)
     fill_pct = min(
         100.0,
@@ -1630,40 +1873,23 @@ def render_global_oil_inventory_clock(now_utc: datetime) -> None:
     _d0 = HORMUZ_OIL_CLOSURE_START_DATE.strftime("%Y-%m-%d")
     _today_s = today.strftime("%Y-%m-%d")
 
-    if buffer_days is not None:
-        _res_fmt = f"{GLOBAL_STRATEGIC_RESERVE_MMBBL:,.0f}"
-        _draw = abs(net_daily_mbpd)
-        _buffer_runway_inner_html = (
-            f'<div><span class="obr-value">{buffer_days:.1f}</span>'
-            f'<span class="obr-unit">days</span></div>'
-            f'<div class="obr-formula">Assumes <b>{_res_fmt} M bbl</b> '
-            f"(1.5 billion bbl) global strategic reserve ÷ "
-            f'<b>{_draw:.1f} M bpd</b> net draw '
-            f"(|net daily deficit|). At constant deficit, theoretical dry-up runway.</div>"
-        )
-    else:
-        _buffer_runway_inner_html = (
-            '<div class="obr-formula">Net balance is not a drawdown — buffer countdown '
-            "does not apply (surplus or balanced scenario).</div>"
-        )
-
     st.markdown(
         f"""
         <style>
           .global-oil-clock {{
-            border: 2px solid #ff2222;
+            border: 1px solid #4e5a68;
             border-radius: 14px;
-            background: linear-gradient(180deg, rgba(40,0,0,0.55) 0%, rgba(10,0,0,0.9) 100%);
+            background: linear-gradient(180deg, rgba(23,29,36,0.96) 0%, rgba(16,21,27,0.98) 100%);
             padding: 16px 18px 18px 18px;
             margin: 0 0 14px 0;
-            box-shadow: 0 0 24px rgba(255, 30, 30, 0.35);
+            box-shadow: 0 8px 18px rgba(0, 0, 0, 0.2);
           }}
           .global-oil-clock h2 {{
             margin: 0 0 10px 0;
-            font-size: 1.35rem;
-            letter-spacing: 0.12em;
-            color: #fff0f0;
-            font-weight: 900;
+            font-size: 1.2rem;
+            letter-spacing: 0.08em;
+            color: #dce3ea;
+            font-weight: 700;
           }}
           .global-oil-clock .oil-row {{
             font-size: 1.05rem;
@@ -1681,7 +1907,7 @@ def render_global_oil_inventory_clock(now_utc: datetime) -> None:
             margin-top: 10px;
             font-size: 1.15rem;
             font-weight: 800;
-            color: #ffff00;
+            color: #d5dee8;
           }}
           .global-oil-clock .oil-x33 {{
             margin-top: 6px;
@@ -1690,25 +1916,25 @@ def render_global_oil_inventory_clock(now_utc: datetime) -> None:
           }}
           .oil-meter-wrap {{
             margin-top: 14px;
-            border: 1px solid #ff4444;
+            border: 1px solid #4e5a68;
             border-radius: 10px;
             height: 28px;
-            background: #1a0505;
+            background: #1a2129;
             overflow: hidden;
           }}
           .oil-meter-fill {{
             height: 100%;
             width: {fill_pct:.1f}%;
-            background: linear-gradient(90deg, #ff0000 0%, #ff4444 50%, #ff0000 100%);
-            box-shadow: 0 0 18px rgba(255, 0, 0, 0.85);
+            background: linear-gradient(90deg, #607286 0%, #8ea1b2 50%, #607286 100%);
+            box-shadow: none;
             transition: width 0.4s ease-out;
           }}
           .oil-meter-label {{
             margin-top: 8px;
             font-size: 1.25rem;
             font-weight: 900;
-            color: #ff3333;
-            text-shadow: 0 0 12px rgba(255, 0, 0, 0.55);
+            color: #c4ced9;
+            text-shadow: none;
           }}
           .oil-meter-cap {{
             font-size: 0.82rem;
@@ -1718,14 +1944,14 @@ def render_global_oil_inventory_clock(now_utc: datetime) -> None:
           .oil-buffer-runway {{
             margin-top: 14px;
             padding: 12px 14px 14px 14px;
-            border: 1px dashed #ff8888;
+            border: 1px dashed #5c6875;
             border-radius: 10px;
-            background: rgba(60, 0, 0, 0.4);
+            background: rgba(26, 34, 43, 0.6);
           }}
           .oil-buffer-runway .obr-title {{
             font-size: 0.78rem;
             letter-spacing: 0.14em;
-            color: #ffcccc;
+            color: #b7c3cf;
             font-weight: 800;
             margin-bottom: 6px;
           }}
@@ -1735,11 +1961,11 @@ def render_global_oil_inventory_clock(now_utc: datetime) -> None:
             font-variant-numeric: tabular-nums;
             color: #ffffff;
             line-height: 1.1;
-            text-shadow: 0 0 16px rgba(255, 60, 60, 0.65);
+            text-shadow: none;
           }}
           .oil-buffer-runway .obr-unit {{
             font-size: 1.05rem;
-            color: #ffaaaa;
+            color: #a5b3c0;
             font-weight: 700;
             margin-left: 4px;
           }}
@@ -1764,7 +1990,7 @@ def render_global_oil_inventory_clock(now_utc: datetime) -> None:
           </div>
           <div class="oil-sub">
             • UAE Fujairah (Habshan–Fujairah): <b>+{remedy_uae_fujairah:+.1f}</b>
-            — <span style="color:#ff6666;">STATUS: SHUT DOWN</span>
+            — <span style="color:#b7c3cf;">STATUS: SHUT DOWN</span>
             (drone damage at terminal).
           </div>
           <div class="oil-sub">
@@ -1772,13 +1998,20 @@ def render_global_oil_inventory_clock(now_utc: datetime) -> None:
             — resumed Mar 18.
           </div>
           <div class="oil-net">
-            <code style="color:#ffaaaa;">net_daily_deficit</code> = (losses) + (remedies):
-            <span style="color:#ff4444;">{net_daily_mbpd:+.1f} mio bpd</span>
+            <code style="color:#a5b3c0;">net_daily_deficit</code> = (losses) + (remedies):
+            <span style="color:#c4ced9;">{net_daily_mbpd:+.1f} mio bpd</span>
           </div>
-          <div class="oil-buffer-runway">
-            <div class="obr-title">DAYS OF GLOBAL BUFFER REMAINING</div>
-            {_buffer_runway_inner_html}
-          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.container(border=True):
+        _run_live_iea_buffer_countdown()
+
+    st.markdown(
+        f"""
+        <div class="global-oil-clock global-oil-clock--tail" style="margin-top:6px;">
           <div class="oil-x33">
             <b><code style="color:#ffcccc;">accumulated_33d</code>:</b>
             ({net_daily_mbpd:+.1f} mio bpd × {X33_WINDOW_DAYS} d)
@@ -1841,6 +2074,7 @@ def _yf_download_with_retry(
                 auto_adjust=False,
                 progress=False,
                 threads=False,
+                proxy="",
             )
         except Exception:
             last = pd.DataFrame()
@@ -1852,6 +2086,31 @@ def _yf_download_with_retry(
                 return last
         time.sleep(delay_s * (attempt + 1))
     return last if last is not None else pd.DataFrame()
+
+
+def _stooq_last_prev(symbol: str, *, timeout_s: float = 10.0) -> tuple[float | None, float | None]:
+    """
+    Fetch (last, prev_close) from Stooq CSV endpoints.
+    Some futures symbols can return N/D; those map to (None, None).
+    """
+    try:
+        u = f"https://stooq.com/q/l/?s={symbol}&i=d"
+        r = requests.get(u, timeout=timeout_s, proxies={"http": None, "https": None})
+        r.raise_for_status()
+        txt = (r.text or "").strip()
+        if not txt:
+            return None, None
+        parts = [p.strip() for p in txt.split(",")]
+        if len(parts) < 7:
+            return None, None
+        close_s = parts[6]
+        if close_s.upper() == "N/D":
+            return None, None
+        last = _safe_float(close_s)
+        # Stooq quote endpoint does not reliably return previous close in this format.
+        return last, None
+    except Exception:
+        return None, None
 
 
 def fetch_market_watch() -> list[dict]:
@@ -1883,11 +2142,23 @@ def fetch_market_watch() -> list[dict]:
                 d = daily2["Close"].dropna()
             if len(d) >= 2:
                 prev_close = _safe_float(d.iloc[-2])
+            if (last is None) and len(d) >= 1:
+                last = _safe_float(d.iloc[-1])
         except Exception:
             prev_close = None
 
         if (prev_close is not None) and (last is not None) and prev_close != 0:
             pct = (last - prev_close) / prev_close * 100.0
+        elif last is None:
+            # Yahoo can rate-limit aggressively (HTTP 429); fallback to Stooq for continuity.
+            stooq_symbol = f"{t.lower()}.us"
+            last_s, prev_s = _stooq_last_prev(stooq_symbol)
+            if last_s is not None:
+                last = last_s
+            if prev_s is not None:
+                prev_close = prev_s
+            if (prev_close is not None) and (last is not None) and prev_close != 0:
+                pct = (last - prev_close) / prev_close * 100.0
 
         out.append(
             {
@@ -1916,6 +2187,15 @@ _COMMODITY_DEFS: list[tuple[str, str, str]] = [
     ("Fertilizer", "NTR", "$/sh NTR"),
     ("Gasoline", "RB=F", "$/gal"),
 ]
+
+_COMMODITY_STOOQ_SYMBOLS: dict[str, str] = {
+    "GC=F": "gc.f",
+    "SI=F": "si.f",
+    "BZ=F": "cb.f",
+    "ALI=F": "ali.f",
+    "NTR": "ntr.us",
+    "RB=F": "rb.f",
+}
 
 
 def fetch_commodity_watch() -> list[dict]:
@@ -1948,11 +2228,23 @@ def fetch_commodity_watch() -> list[dict]:
                 d = daily2["Close"].dropna()
             if len(d) >= 2:
                 prev_close = _safe_float(d.iloc[-2])
+            if (last is None) and len(d) >= 1:
+                last = _safe_float(d.iloc[-1])
         except Exception:
             prev_close = None
 
         if (prev_close is not None) and (last is not None) and prev_close != 0:
             pct = (last - prev_close) / prev_close * 100.0
+        elif last is None:
+            s_sym = _COMMODITY_STOOQ_SYMBOLS.get(t)
+            if s_sym:
+                last_s, prev_s = _stooq_last_prev(s_sym)
+                if last_s is not None:
+                    last = last_s
+                if prev_s is not None:
+                    prev_close = prev_s
+                if (prev_close is not None) and (last is not None) and prev_close != 0:
+                    pct = (last - prev_close) / prev_close * 100.0
 
         out.append(
             {
@@ -2006,14 +2298,14 @@ def render_commodity_tracker(rows: list[dict]) -> None:
         ch_s = "—" if ch is None else f"{ch:+.2f}%"
         p_s = _format_commodity_price(lab, float(price) if price is not None else None)
         is_down = (ch is not None) and (ch <= -2.0)
-        label_color = "#FFFFFF"
-        num_color = "#FFFF00"
-        ch_color = "#ff3b3b" if is_down else num_color
-        bg = "rgba(255, 0, 0, 0.10)" if is_down else "rgba(255, 255, 255, 0.06)"
+        label_color = "#dce3ea"
+        num_color = "#c7d3df"
+        ch_color = "#c49090" if is_down else num_color
+        bg = "rgba(196, 144, 144, 0.10)" if is_down else "rgba(255, 255, 255, 0.05)"
         sub = html.escape(unit)
         c.markdown(
             f"""
-            <div style="border:2px solid #FFFFFF; background:{bg}; border-radius:10px; padding:10px 10px; margin-bottom:8px;">
+            <div style="border:1px solid #556373; background:{bg}; border-radius:10px; padding:10px 10px; margin-bottom:8px;">
               <div style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
                 <div style="font-weight:900; color:{label_color}; letter-spacing:0.06em; font-size:0.95rem;">{html.escape(lab)}</div>
                 <div style="font-weight:900; color:{ch_color}; font-size:0.95rem;">{ch_s}</div>
@@ -2039,13 +2331,13 @@ def render_market_grid(rows: list[dict]) -> None:
             ch_s = "—" if ch is None else f"{ch:+.2f}%"
             p_s = "—" if p is None else f"${p:,.2f}"
             is_down = (ch is not None) and (ch <= -2.0)
-            label_color = "#FFFFFF"
-            num_color = "#FFFF00"
-            ch_color = "#ff3b3b" if is_down else num_color
-            bg = "rgba(255, 0, 0, 0.10)" if is_down else "rgba(255, 255, 255, 0.06)"
+            label_color = "#dce3ea"
+            num_color = "#c7d3df"
+            ch_color = "#c49090" if is_down else num_color
+            bg = "rgba(196, 144, 144, 0.10)" if is_down else "rgba(255, 255, 255, 0.05)"
             c.markdown(
                 f"""
-                <div style="border:2px solid #FFFFFF; background:{bg}; border-radius:10px; padding:10px 10px; margin-bottom:8px;">
+                <div style="border:1px solid #556373; background:{bg}; border-radius:10px; padding:10px 10px; margin-bottom:8px;">
                   <div style="display:flex; justify-content:space-between; align-items:center;">
                     <div style="font-weight:900; color:{label_color}; letter-spacing:0.10em; font-size:1rem;">{t}</div>
                     <div style="font-weight:900; color:{ch_color}; font-size:1.05rem;">{ch_s}</div>
@@ -2062,6 +2354,145 @@ def render_market_grid(rows: list[dict]) -> None:
         )
 
 
+def render_supply_snapshot_compact(now_utc: datetime) -> None:
+    """Compact replacement for oversized oil/deficit hero blocks."""
+    days_since = max(0, (now_utc.date() - HORMUZ_OIL_CLOSURE_START_DATE).days)
+    net_daily_mbpd = net_daily_deficit()
+    acc33 = accumulated_33d()
+    total_depletion_mmbbl = net_daily_mbpd * float(days_since)
+
+    c1, c2, c3, c4 = st.columns(4, gap="small")
+    c1.metric("Net Daily Deficit", f"{net_daily_mbpd:+.1f} mio bpd")
+    c2.metric("X33 Accumulated", f"{acc33:+.1f} M bbl")
+    c3.metric("Since War Start", f"{total_depletion_mmbbl:+.1f} M bbl")
+    c4.metric("Days Since Anchor", f"{days_since}")
+    st.caption(
+        "Computed from losses/remedies model (Hormuz + Russia vs Yanbu/Fujairah/Iraq-Turkey pathways)."
+    )
+
+
+def render_bgri_snapshot_compact(
+    bgri: BgriResult, *, russia_additional_cut_mbpd: float = RUSSIA_SCENARIO_ADDITIONAL_CUT_MBPD
+) -> None:
+    """Compact risk snapshot without large gauge visuals."""
+    panic_bonus = russia_discerner_global_panic_bonus(russia_additional_cut_mbpd)
+    global_panic = min(100, max(0, bgri.score + panic_bonus))
+    st.metric("Global Panic Score", f"{global_panic}/100", delta=f"{bgri.pct_vs_baseline:+.0f}% vs baseline")
+    st.caption(
+        f"Hits: {bgri.today_hits} vs baseline {BGRI_BASELINE_HITS:g} "
+        f"({bgri.headline_sample_size} headlines scanned)."
+    )
+
+
+def render_news_monitors(
+    *,
+    entries: list[dict],
+    tehran_official_rows: list[dict],
+    tehran_feed_caption: str | None,
+    tactical_osint_rows: list[dict],
+    ukraine_oil_rows: list[UkraineOilInfraScrapeRow],
+    hormuz_kinetic_flash: bool,
+) -> None:
+    """Always-visible news monitors section near top of dashboard."""
+    st.subheader("News Monitors")
+
+    discerner = evaluate_strait_status_from_live_entries(entries)
+    discerner = apply_kinetic_hormuz_maximum_override(discerner, hormuz_kinetic=hormuz_kinetic_flash)
+    if hormuz_kinetic_flash:
+        st.warning("Kinetic activity flagged within the Hormuz 50km rule.")
+
+    rationale_esc = html.escape(discerner.rationale)
+    status_esc = html.escape(discerner.strait_status)
+    risk_esc = html.escape(discerner.war_risk_level)
+    st.markdown(
+        f"""
+        <div class="discerner-logic-box">
+          <p><strong>The Discerner (Live):</strong> Strait status <strong>{status_esc}</strong>
+          • War risk <strong>{risk_esc}</strong></p>
+          <p class="discerner-rationale">{rationale_esc}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    link_cols = {
+        "No.": st.column_config.NumberColumn("No.", width="small"),
+        "Date/Time (UTC)": st.column_config.TextColumn("Time (UTC)", width="small"),
+        "Title": st.column_config.TextColumn("Title", width="medium"),
+        "Source": st.column_config.TextColumn("Source", width="small"),
+        "Link": st.column_config.LinkColumn("Article", display_text="View Source", help="Open original article"),
+    }
+    link_cols_no_time = {k: v for k, v in link_cols.items() if k != "Date/Time (UTC)"}
+
+    pane_l, pane_r = st.columns([1, 1], gap="medium")
+    with pane_l:
+        with st.container(border=True):
+            st.markdown("### Official Tehran Narrative")
+            st.caption(f"Items: {len(tehran_official_rows)}")
+            if not tehran_official_rows:
+                st.caption(
+                    tehran_feed_caption
+                    or "No articles from NewsData.io or Press TV RSS (check secrets, quota, or network)."
+                )
+            else:
+                if tehran_feed_caption:
+                    st.caption(tehran_feed_caption)
+                df_t = _prepare_intel_dataframe(tehran_official_rows, include_time_column=False)
+                if df_t is not None:
+                    df_show = pd.DataFrame(
+                        {
+                            "No.": df_t["No."].astype(int),
+                            "Source": df_t["Source"].astype(str),
+                            "Title": df_t["Title"].astype(str),
+                            "Link": df_t["Link"].astype(str),
+                        }
+                    )
+                    st.dataframe(
+                        df_show,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config=link_cols_no_time,
+                        column_order=["No.", "Source", "Title", "Link"],
+                        key="official_tehran_narrative",
+                    )
+    with pane_r:
+        with st.container(border=True):
+            st.markdown("### Kinetic Events & Interceptions")
+            st.caption(f"Items: {len(tactical_osint_rows)}")
+            if not tactical_osint_rows:
+                st.caption("No kinetic headlines yet from LiveUAMap scrapers or Google fallback.")
+            else:
+                df_k = _prepare_intel_dataframe(tactical_osint_rows)
+                if df_k is not None:
+                    st.dataframe(
+                        df_k[["No.", "Date/Time (UTC)", "Source", "Title", "Link"]],
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config=link_cols,
+                        key="kinetic_osint_intel",
+                    )
+            st.markdown('<div style="height:10px"></div>', unsafe_allow_html=True)
+            render_ukraine_oil_infra_intel_panel(ukraine_oil_rows, link_cols=link_cols)
+
+    with st.container(border=True):
+        st.markdown("### Aggregated Open-Source News")
+        st.caption(f"Items: {len(entries)}")
+        if entries:
+            df_news = _prepare_intel_dataframe(entries)
+            if df_news is not None:
+                st.dataframe(
+                    df_news[["No.", "Date/Time (UTC)", "Source", "Title", "Link"]],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config=link_cols,
+                    key="aggregated_news_intel",
+                )
+            else:
+                st.warning("Waiting for news sync...")
+        else:
+            st.warning("No RSS entries were fetched.")
+
+
 def render_intel_cards(intel_feed: list[dict]) -> None:
     for item in intel_feed[:12]:
         source = (item.get("source") or "—").strip()
@@ -2073,8 +2504,8 @@ def render_intel_cards(intel_feed: list[dict]) -> None:
         risk = risk_level_from_score(score)
 
         is_irgc = "IRGC" in source.upper()
-        border = "#ff3b3b" if is_irgc else "#2b2b2b"
-        title_color = "#ff3b3b" if is_irgc else "#e6e6e6"
+        border = "#7d8a98" if is_irgc else "#2b2f35"
+        title_color = "#c7d3df" if is_irgc else "#d9e1e8"
 
         st.markdown(
             f"""
@@ -2110,6 +2541,7 @@ def render_intel_cards(intel_feed: list[dict]) -> None:
 
 
 def main() -> None:
+    _disable_proxy_env_for_live_feeds()
     st.set_page_config(
         page_title="Iran War Intelligence Dashboard",
         page_icon="🛰️",
@@ -2133,71 +2565,59 @@ def main() -> None:
     bgri_live_entries = _cached_live_entries()
     ukraine_oil_rows = _cached_ukraine_liveuamap_oil_infra_rows()
     shadow_intel_assessments = _cached_shadow_fleet_assessments()
+    mw = _cached_market_watch()
 
-    st.markdown(
-        '<div style="height:0.35rem" aria-hidden="true"></div>',
-        unsafe_allow_html=True,
-    )
-
-    # First on the page: combined OSINT marquee (kinetic + Ukraine oil infra), then manual refresh
-    render_dashboard_osint_marquee(tactical_osint_rows, ukraine_oil_rows)
-
-    _top_pad, _top_refresh = st.columns([7, 1], gap="small")
-    with _top_refresh:
+    top_left, top_mid, top_right = st.columns([1, 2.8, 1], gap="small")
+    with top_mid:
+        st.title("Iran War Monitor")
+        st.caption("Calm briefing layout focused on status, shipping risk, and verified intelligence updates.")
+    with top_right:
         if st.button(
-            "🔄 Manual Refresh",
+            "Refresh Data",
             use_container_width=True,
             key="manual_refresh_top_right",
             help="Clear cached RSS, news, and market data and rerun",
         ):
             st.cache_data.clear()
             st.rerun()
-    st.markdown(
-        '<div style="height:0.15rem" aria-hidden="true"></div>',
-        unsafe_allow_html=True,
-    )
 
     st.markdown(
         """
         <style>
-          /*
-            High-contrast theme: drive Streamlit tokens so widgets use white on black.
-            Do not hide stToolbar — it can collapse the main flex layout on some builds.
-          */
           :root {
-            --st-text-color: #ffffff !important;
-            --st-background-color: #000000 !important;
-            --st-secondary-background-color: #141414 !important;
+            --st-text-color: #dce3ea !important;
+            --st-background-color: #0f1318 !important;
+            --st-secondary-background-color: #171d24 !important;
           }
           .stApp {
-            background-color: #000000 !important;
-            color: #ffffff !important;
+            background-color: #0f1318 !important;
+            color: #dce3ea !important;
           }
           [data-testid="stAppViewContainer"],
           [data-testid="stMain"] {
-            background-color: #000000 !important;
-            color: #ffffff !important;
+            background-color: #0f1318 !important;
+            color: #dce3ea !important;
           }
           .stApp [data-testid="stMarkdownContainer"],
           .stApp [data-testid="stVerticalBlock"] {
-            color: #ffffff !important;
+            color: #dce3ea !important;
           }
           .stApp p, .stApp li, .stApp label, .stApp .stMarkdown {
-            color: #ffffff !important;
+            color: #dce3ea !important;
           }
           .stApp p, .stApp .stMarkdown p, .stApp [data-testid="stMarkdownContainer"] p {
-            font-size: 1.2rem !important;
-            line-height: 1.55 !important;
+            font-size: 1rem !important;
+            line-height: 1.5 !important;
           }
-          .stApp h1 { font-size: 3.3rem !important; }
-          .stApp h2 { font-size: 2.64rem !important; }
-          .stApp h3 { font-size: 2.04rem !important; }
-          .stApp .stMarkdown h1 { font-size: 3.3rem !important; }
-          .stApp .stMarkdown h2 { font-size: 2.64rem !important; }
-          .stApp .stMarkdown h3 { font-size: 2.04rem !important; }
+          .stApp h1 { font-size: 2rem !important; }
+          .stApp h2 { font-size: 1.5rem !important; }
+          .stApp h3 { font-size: 1.25rem !important; }
+          .stApp .stMarkdown h1 { font-size: 2rem !important; }
+          .stApp .stMarkdown h2 { font-size: 1.5rem !important; }
+          .stApp .stMarkdown h3 { font-size: 1.25rem !important; }
 
-          [data-testid="stMetricValue"] { color: #ffff00 !important; font-weight: 800 !important; }
-          [data-testid="stMetricLabel"] { color: #ffffff !important; font-size: 1.05rem !important; }
+          [data-testid="stMetricValue"] { color: #e4ebf2 !important; font-weight: 700 !important; }
+          [data-testid="stMetricLabel"] { color: #aab5c1 !important; font-size: 0.95rem !important; }
 
           section[data-testid="stSidebar"] [data-testid="stDataFrame"] td {
             color: #ffff00 !important;
@@ -2210,24 +2630,24 @@ def main() -> None:
           }
 
           .discerner-logic-box {
-            border: 2px solid #ffffff;
+            border: 1px solid #4e5a68;
             border-radius: 10px;
             padding: 14px 16px;
             margin: 0 0 12px 0;
-            background: #0a0a0a;
+            background: #151b22;
           }
           .discerner-logic-box p {
-            font-size: 1.2rem !important;
-            color: #ffffff !important;
+            font-size: 1rem !important;
+            color: #dce3ea !important;
             margin: 0 0 8px 0;
           }
           .discerner-logic-box .discerner-rationale {
-            font-size: 1.05rem !important;
+            font-size: 0.95rem !important;
             opacity: 1;
-            color: #ffffff !important;
+            color: #c2ccd6 !important;
           }
 
-          [data-testid="stHeader"] { background-color: #000000 !important; }
+          [data-testid="stHeader"] { background-color: #0f1318 !important; }
           [data-testid="stDataFrame"] td,
           [data-testid="stDataFrame"] th {
             white-space: normal !important;
@@ -2235,71 +2655,45 @@ def main() -> None:
             vertical-align: top !important;
           }
           .region-trade-heading {
-            font-size: 0.9rem;
-            font-weight: 900;
-            letter-spacing: 0.18em;
-            color: #fffacd !important;
+            font-size: 0.8rem;
+            font-weight: 700;
+            letter-spacing: 0.12em;
+            color: #c4ced8 !important;
             margin-bottom: 10px;
             padding-bottom: 6px;
-            border-bottom: 1px solid rgba(255, 255, 255, 0.35);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.2);
           }
           .eu-metric-slot .eu-metric-label {
             font-size: 0.82rem;
-            color: #c8c8c8 !important;
+            color: #98a6b4 !important;
             letter-spacing: 0.02em;
             margin-bottom: 2px;
           }
           .eu-metric-slot .eu-final-sales-value {
-            color: #ffff00 !important;
-            font-weight: 900;
-            font-size: 1.65rem;
+            color: #dbe4ed !important;
+            font-weight: 700;
+            font-size: 1.35rem;
             line-height: 1.15;
           }
-          @keyframes euSupplyChainBlink {
-            0%, 100% { color: #ff6464; text-shadow: 0 0 0 transparent; }
-            50% { color: #ff0000; text-shadow: 0 0 16px rgba(255, 0, 0, 0.9); }
-          }
           .eu-metric-slot .eu-supply-chain-value {
-            animation: euSupplyChainBlink 1.05s ease-in-out infinite;
-            font-weight: 900;
-            font-size: 1.65rem;
+            color: #b8c6d4 !important;
+            font-weight: 700;
+            font-size: 1.35rem;
             line-height: 1.15;
           }
           .eu-metric-slot .eu-metric-block { margin-bottom: 14px; }
           .eu-metric-slot .eu-metric-block:last-child { margin-bottom: 0; }
-          .block-container { padding-top: 1.2rem; }
+          .block-container { padding-top: 0.8rem; max-width: 1200px; }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
     if hormuz_kinetic_flash:
-        st.markdown(
-            """
-            <style>
-              [data-testid="stHeader"] {
-                background-color: #7a0000 !important;
-                animation: hormuzHeaderFlash 1.1s ease-in-out infinite !important;
-              }
-              @keyframes hormuzHeaderFlash {
-                0%, 100% {
-                  background-color: #3d0000 !important;
-                  box-shadow: 0 0 0 rgba(255, 0, 0, 0);
-                }
-                50% {
-                  background-color: #ff0000 !important;
-                  box-shadow: 0 0 28px rgba(255, 60, 60, 0.95);
-                }
-              }
-            </style>
-            """,
-            unsafe_allow_html=True,
-        )
+        st.warning("Kinetic activity flagged inside the Hormuz 50km rule.")
 
-    render_x33_global_inventory_deficit_gauge()
-    render_global_oil_inventory_clock(now)
-    render_x33_industry_impact_table()
-    render_shadow_fleet_detection_panel(now)
+    with st.container(border=True):
+        render_supply_snapshot_compact(now)
 
     with st.sidebar:
         st.caption("UI build 2026-04-02c — if missing, Streamlit is not using this app.py")
@@ -2328,94 +2722,100 @@ def main() -> None:
                 if _a.reasons:
                     for _r in _a.reasons:
                         st.caption(html.escape(_r))
-        st.subheader("DEEPSTATE KINETIC FEED")
-        _ds_hits = _cached_deepstate_energy_hits()[:3]
-        if not _ds_hits:
-            st.caption(
-                "No posts matched oil-plant / strike keywords in the scraped window, "
-                "or DeepState preview fetch failed."
+        with st.expander("DeepState Kinetic Feed", expanded=False):
+            _ds_hits = _cached_deepstate_energy_hits()[:3]
+            if not _ds_hits:
+                st.caption(
+                    "No posts matched oil-plant / strike keywords in the scraped window, "
+                    "or DeepState preview fetch failed."
+                )
+            else:
+                for _i, _hit in enumerate(_ds_hits, start=1):
+                    with st.container(border=True):
+                        st.caption(f"Energy hit #{_i} · {html.escape(_hit.matched_keyword)}")
+                        st.markdown(f"**{html.escape(_hit.kinetic_label)}**")
+                        st.markdown(html.escape(_hit.summary))
+                        if _hit.source_url:
+                            try:
+                                st.link_button(
+                                    "Open in Telegram",
+                                    _hit.source_url,
+                                    use_container_width=True,
+                                    key=f"deepstate_tg_{_i}",
+                                )
+                            except TypeError:
+                                uq = html.escape(_hit.source_url, quote=True)
+                                st.markdown(
+                                    f'<a href="{uq}" target="_blank" rel="noopener noreferrer">'
+                                    f"Open in Telegram</a>",
+                                    unsafe_allow_html=True,
+                                )
+
+        with st.expander("Market Watch", expanded=False):
+            if mw:
+                mw_df = pd.DataFrame(mw)
+
+                def _style_row(row):
+                    ch = row.get("% Change")
+                    if pd.notna(ch) and float(ch) <= -2.0:
+                        return ["color: #c98f8f; font-weight: 700; font-size: 1rem"] * len(row)
+                    return ["color: #d4dde6; font-weight: 600; font-size: 1rem"] * len(row)
+
+                st.dataframe(
+                    mw_df.style.apply(_style_row, axis=1),
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Ticker": st.column_config.TextColumn("Ticker", width="small"),
+                        "Price": st.column_config.NumberColumn("Price", format="$%.2f", width="small"),
+                        "% Change": st.column_config.NumberColumn("% Chg", format="%.2f%%", width="small"),
+                    },
+                )
+            else:
+                st.caption("Market watch unavailable (yfinance fetch failed).")
+
+        with st.expander("Private Exposure Watch", expanded=False):
+            st.write("OpenAI — $852B Val")
+            st.write("Anthropic — $380B Val")
+
+        with st.expander("Strait Monitor Details", expanded=False):
+            if st.button("Refresh Strait Monitor", use_container_width=True):
+                st.cache_data.clear()
+                st.rerun()
+            hs = _cached_hormuz_stats()
+            st.write(f"**As-of (UTC):** {hs.asof_date_utc.strftime('%Y-%m-%d') if hs.asof_date_utc else '—'}")
+            st.write(f"**Daily Transits:** {hs.daily_transits_total if hs.daily_transits_total is not None else '—'}")
+            st.write(
+                f"**Wait-List (Fujairah proxy):** {_fujairah_waitlist_display_value(hs.wait_list_tankers_fujairah_proxy)}"
             )
-        else:
-            for _i, _hit in enumerate(_ds_hits, start=1):
-                with st.container(border=True):
-                    st.caption(f"Energy hit #{_i} · {html.escape(_hit.matched_keyword)}")
-                    st.markdown(f"**{html.escape(_hit.kinetic_label)}**")
-                    st.markdown(html.escape(_hit.summary))
-                    if _hit.source_url:
-                        try:
-                            st.link_button(
-                                "Open in Telegram",
-                                _hit.source_url,
-                                use_container_width=True,
-                                key=f"deepstate_tg_{_i}",
-                            )
-                        except TypeError:
-                            uq = html.escape(_hit.source_url, quote=True)
-                            st.markdown(
-                                f'<a href="{uq}" target="_blank" rel="noopener noreferrer">'
-                                f"Open in Telegram</a>",
-                                unsafe_allow_html=True,
-                            )
-            st.markdown('<div style="height:0.75rem"></div>', unsafe_allow_html=True)
-
-        st.subheader("Market Watch")
-
-        mw = _cached_market_watch()
-
-        if mw:
-            mw_df = pd.DataFrame(mw)
-
-            def _style_row(row):
-                ch = row.get("% Change")
-                if pd.notna(ch) and float(ch) <= -2.0:
-                    return ["color: #ff3b3b; font-weight: 800; font-size: 1.1rem"] * len(row)
-                return ["color: #FFFF00; font-weight: 700; font-size: 1.1rem"] * len(row)
-
-            st.dataframe(
-                mw_df.style.apply(_style_row, axis=1),
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Ticker": st.column_config.TextColumn("Ticker", width="small"),
-                    "Price": st.column_config.NumberColumn("Price", format="$%.2f", width="small"),
-                    "% Change": st.column_config.NumberColumn("% Chg", format="%.2f%%", width="small"),
-                },
-            )
-        else:
-            st.caption("Market watch unavailable (yfinance fetch failed).")
-
-        st.markdown("**PRIVATE - HIGH EXPOSURE**")
-        st.write("OpenAI — $852B Val")
-        st.write("Anthropic — $380B Val")
-
-        st.subheader("Strait Monitor")
-        if st.button("🔄 Refresh Strait Monitor", use_container_width=True):
-            st.cache_data.clear()
-            st.rerun()
-
-        hs = _cached_hormuz_stats()
-        st.write(f"**As-of (UTC):** {hs.asof_date_utc.strftime('%Y-%m-%d') if hs.asof_date_utc else '—'}")
-        st.write(f"**Daily Transits:** {hs.daily_transits_total if hs.daily_transits_total is not None else '—'}")
-        st.write(
-            f"**Wait-List (Fujairah proxy):** {_fujairah_waitlist_display_value(hs.wait_list_tankers_fujairah_proxy)}"
-        )
-        st.markdown(f"**{FUJAIRAH_QUEUE_STATUS}**")
-        if hs.trade_value_drop_pct:
-            st.write("**Trade Value Drop (%):**")
-            for k in ["EU", "China", "US"]:
-                if k in hs.trade_value_drop_pct:
-                    st.write(f"- **{k}**: {hs.trade_value_drop_pct[k]}%")
-        if hs.blockade_detected:
-            st.error("BLOCKADE DETECTED (Daily transits < 15)")
-        for n in hs.notes:
-            st.caption(n)
+            st.markdown(f"**{FUJAIRAH_QUEUE_STATUS}**")
+            if hs.trade_value_drop_pct:
+                st.write("**Trade Value Drop (%):**")
+                for k in ["EU", "China", "US"]:
+                    if k in hs.trade_value_drop_pct:
+                        st.write(f"- **{k}**: {hs.trade_value_drop_pct[k]}%")
+            if hs.blockade_detected:
+                st.error("BLOCKADE DETECTED (Daily transits < 15)")
+            for n in hs.notes:
+                st.caption(n)
 
     _bgri = compute_bgri(bgri_live_entries, tehran_official_rows, tactical_osint_rows)
-    render_bgri_attention_gauge(_bgri)
+    with st.container(border=True):
+        st.subheader("Risk Snapshot")
+        render_bgri_snapshot_compact(_bgri)
+    with st.container(border=True):
+        render_news_monitors(
+            entries=bgri_live_entries,
+            tehran_official_rows=tehran_official_rows,
+            tehran_feed_caption=tehran_feed_caption,
+            tactical_osint_rows=tactical_osint_rows,
+            ukraine_oil_rows=ukraine_oil_rows,
+            hormuz_kinetic_flash=hormuz_kinetic_flash,
+        )
 
     # Big-number metrics (same cache as sidebar — one PortWatch/IMF fetch per TTL, not two)
     hs_main = _cached_hormuz_stats()
-    m1, m2, col_eu, col_cn, col_us = st.columns([1, 1, 1.35, 1.35, 1.35], gap="small")
+    m1, m2, col_eu, col_cn, col_us = st.columns([1, 1, 1.2, 1.2, 1.2], gap="small")
     m1.metric("Hormuz Daily Transits", hs_main.daily_transits_total if hs_main.daily_transits_total is not None else "—")
     with m2:
         st.markdown(f"**{FUJAIRAH_QUEUE_STATUS}**")
@@ -2469,11 +2869,8 @@ def main() -> None:
     if hs_main.blockade_detected:
         st.error("BLOCKADE DETECTED: Strait of Hormuz daily transits below 15.")
 
-    st.subheader("War Room — Tactical Shipping Map")
-    st.caption(
-        "Includes **Russia heatmap**, **Gotland transfer polygon** (dashed), **STS hub pulse**, "
-        "**Shadow Fleet** vessel markers (gray / violet / red), and **LiveUAMap Ukraine** pulses."
-    )
+    st.subheader("Tactical Shipping & Risk Table")
+    st.caption("Map removed. Table below contains the same tactical layers and signals.")
     _dl = now - DEADLINE_UTC
     if _dl.total_seconds() > 0:
         _mins = int(_dl.total_seconds() // 60)
@@ -2485,154 +2882,50 @@ def main() -> None:
         st.caption(
             "Suez corridor assessed blocked under high kinetic risk; Cape of Good Hope diversion is the active lane (+~20 days)."
         )
-    streamlit_folium.st_folium(
-        build_tactical_war_room_map(
-            hs_main.trade_value_drop_pct,
-            shadow_fleet_assessments=shadow_intel_assessments,
-        ),
-        use_container_width=True,
-        height=460,
-        returned_objects=[],
-        key="war_room_tactical_map",
+    tactical_df = tactical_shipping_risk_table(
+        trade_drop_pct=hs_main.trade_value_drop_pct,
+        shadow_fleet_assessments=shadow_intel_assessments,
+        ukraine_oil_rows=ukraine_oil_rows,
     )
-
-    col_left, col_right = st.columns([1.05, 1.35], gap="large")
-
-    with col_left:
-        st.subheader("Shipping Impact")
-        df = shipping_impact_table(now)
-
-        # Override display with explicit scenario values requested for Apr 1, 2026 UI.
-        # (These are presentation values; keep live PortWatch fetch for mode flags.)
-        df.loc[df["Port"] == "Rotterdam", "Transit Delay (Days)"] = 45.0
-        df.loc[df["Port"] == "Trieste", "Transit Delay (Days)"] = 38.0
-        st.dataframe(df, use_container_width=True, hide_index=True)
-        st.error("Rotterdam alert: Suez Transit Effectively Zero.")
-        st.caption("Delays are synthetic. During the deadline window (+24h), Cape routing is forced for EU ports.")
-
-        with st.container(border=True):
-            comm = _cached_commodity_watch()
-            if comm:
-                render_commodity_tracker(comm)
-            else:
-                st.caption("Commodity prices unavailable (yfinance fetch failed).")
-
-    with col_right:
-        st.subheader("Live Intel Feed")
-
-        entries = bgri_live_entries
-        discerner = evaluate_strait_status_from_live_entries(entries)
-        discerner = apply_kinetic_hormuz_maximum_override(discerner, hormuz_kinetic=hormuz_kinetic_flash)
-
-        if hormuz_kinetic_flash:
-            st.error("Kinetic activity flagged within the Hormuz 50km rule — Discerner risk elevated to MAXIMUM.")
-
-        rationale_esc = html.escape(discerner.rationale)
-        status_esc = html.escape(discerner.strait_status)
-        risk_esc = html.escape(discerner.war_risk_level)
-        st.markdown(
-            f"""
-            <div class="discerner-logic-box">
-              <p><strong>The Discerner (Live):</strong> Strait status <strong>{status_esc}</strong>
-              • War risk <strong>{risk_esc}</strong></p>
-              <p class="discerner-rationale">{rationale_esc}</p>
-            </div>
-            """,
-            unsafe_allow_html=True,
+    st.dataframe(
+        tactical_df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Layer": st.column_config.TextColumn("Layer", width="small"),
+            "Location": st.column_config.TextColumn("Location", width="medium"),
+            "Coordinates": st.column_config.TextColumn("Coordinates", width="medium"),
+            "Status": st.column_config.TextColumn("Status", width="small"),
+            "Detail": st.column_config.TextColumn("Detail", width="large"),
+        },
+        key="tactical_shipping_risk_table",
+    )
+    with st.expander("Tactical route geometry (reference)", expanded=False):
+        st.write(
+            {
+                "blocked_suez_nodes": len(WAR_ROOM_SUEZ_BLOCKED_ROUTE_LL),
+                "active_cape_nodes": len(WAR_ROOM_CAPE_ACTIVE_ROUTE_LL),
+                "conflict_branch_nodes": len(WAR_ROOM_CONFLICT_BRANCH_LL),
+            }
         )
-        if discerner.war_risk_level.upper() in ("CRITICAL", "MAXIMUM"):
-            st.warning("Market volatility expected to spike at 16:30 GMT.")
 
-        if mw:
-            render_market_grid(mw)
+    st.subheader("Shipping Impact")
+    df = shipping_impact_table(now)
 
-        link_cols = {
-            "No.": st.column_config.NumberColumn("No.", width="small"),
-            "Date/Time (UTC)": st.column_config.TextColumn("Time (UTC)", width="small"),
-            "Title": st.column_config.TextColumn("Title", width="medium"),
-            "Source": st.column_config.TextColumn("Source", width="small"),
-            "Link": st.column_config.LinkColumn("Article", display_text="View Source", help="Open original article"),
-        }
-        link_cols_no_time = {
-            k: v for k, v in link_cols.items() if k != "Date/Time (UTC)"
-        }
+    # Override display with explicit scenario values requested for Apr 1, 2026 UI.
+    # (These are presentation values; keep live PortWatch fetch for mode flags.)
+    df.loc[df["Port"] == "Rotterdam", "Transit Delay (Days)"] = 45.0
+    df.loc[df["Port"] == "Trieste", "Transit Delay (Days)"] = 38.0
+    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.error("Rotterdam alert: Suez Transit Effectively Zero.")
+    st.caption("Delays are synthetic. During the deadline window (+24h), Cape routing is forced for EU ports.")
 
-        pane_l, pane_r = st.columns([1, 1], gap="medium")
-        with pane_l:
-            with st.container(border=True):
-                st.markdown("### OFFICIAL TEHRAN NARRATIVE")
-                if not tehran_official_rows:
-                    st.caption(
-                        tehran_feed_caption
-                        or "No articles from NewsData.io or Press TV RSS (check secrets, quota, or network)."
-                    )
-                else:
-                    if tehran_feed_caption:
-                        st.caption(tehran_feed_caption)
-                    df_t = _prepare_intel_dataframe(
-                        tehran_official_rows, include_time_column=False
-                    )
-                    if df_t is not None:
-                        # Fresh 4-column frame so deployed UI cannot resurrect a hidden Time
-                        # column from widget state; column_order pins visible cols.
-                        df_show = pd.DataFrame(
-                            {
-                                "No.": df_t["No."].astype(int),
-                                "Source": df_t["Source"].astype(str),
-                                "Title": df_t["Title"].astype(str),
-                                "Link": df_t["Link"].astype(str),
-                            }
-                        )
-                        st.dataframe(
-                            df_show.style.apply(_intel_highlight_row, axis=1),
-                            use_container_width=True,
-                            hide_index=True,
-                            column_config=link_cols_no_time,
-                            column_order=["No.", "Source", "Title", "Link"],
-                            key="official_tehran_narrative",
-                        )
-        with pane_r:
-            # Single bordered card: kinetic table + Ukraine table (same column width as Tehran | this row)
-            with st.container(border=True):
-                st.markdown("### KINETIC EVENTS & INTERCEPTIONS")
-                if not tactical_osint_rows:
-                    st.caption(
-                        "No kinetic headlines yet from LiveUAMap scrapers or Google fallback. "
-                        "If this persists on Cloud, the host may be blocking datacenter IPs — try again after “Clear cache”."
-                    )
-                else:
-                    df_k = _prepare_intel_dataframe(tactical_osint_rows)
-                    if df_k is not None:
-                        st.dataframe(
-                            df_k[["No.", "Date/Time (UTC)", "Source", "Title", "Link"]].style.apply(
-                                _intel_highlight_row, axis=1
-                            ),
-                            use_container_width=True,
-                            hide_index=True,
-                            column_config=link_cols,
-                            key="kinetic_osint_intel",
-                        )
-                st.markdown('<div style="height:14px"></div>', unsafe_allow_html=True)
-                render_ukraine_oil_infra_intel_panel(ukraine_oil_rows, link_cols=link_cols)
-
-        with st.container(border=True):
-            st.markdown("### Aggregated open-source news (Google RSS + BBC)")
-            if entries:
-                df_news = _prepare_intel_dataframe(entries)
-                if df_news is not None:
-                    st.dataframe(
-                        df_news[["No.", "Date/Time (UTC)", "Source", "Title", "Link"]].style.apply(
-                            _intel_highlight_row, axis=1
-                        ),
-                        use_container_width=True,
-                        hide_index=True,
-                        column_config=link_cols,
-                        key="aggregated_news_intel",
-                    )
-                else:
-                    st.warning("Waiting for news sync...")
-            else:
-                st.warning("No RSS entries were fetched.")
+    with st.container(border=True):
+        comm = _cached_commodity_watch()
+        if comm:
+            render_commodity_tracker(comm)
+        else:
+            st.caption("Commodity prices unavailable.")
 
 
 if __name__ == "__main__":
